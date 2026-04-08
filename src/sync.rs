@@ -10,7 +10,6 @@ use walkdir::WalkDir;
 use crate::config::ResolvedPair;
 use crate::gitignore::GitignoreCache;
 
-/// Tracks files recently written by the sync process to suppress echo events.
 pub struct SyncGuard {
     recent: Mutex<HashMap<PathBuf, Instant>>,
     ttl: Duration,
@@ -30,7 +29,6 @@ impl SyncGuard {
         fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
     }
 
-    /// Mark a path as recently written by us. Call before fs::copy.
     pub fn mark(&self, path: &Path) {
         let canonical = Self::normalize(path);
         self.recent
@@ -39,7 +37,6 @@ impl SyncGuard {
             .insert(canonical, Instant::now());
     }
 
-    /// Returns true if this path was recently written by us (echo event).
     pub fn is_echo(&self, path: &Path) -> bool {
         let canonical = Self::normalize(path);
         let map = self.recent.lock().unwrap();
@@ -50,7 +47,6 @@ impl SyncGuard {
         }
     }
 
-    /// Remove expired entries.
     pub fn prune(&self) {
         let mut map = self.recent.lock().unwrap();
         map.retain(|_, instant| instant.elapsed() < self.ttl);
@@ -78,7 +74,6 @@ impl From<std::io::Error> for SyncError {
     }
 }
 
-/// Copy a file from source to dest, marking the guard before writing.
 pub fn sync_file(source: &Path, dest: &Path, guard: &SyncGuard) -> Result<(), SyncError> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
@@ -89,7 +84,6 @@ pub fn sync_file(source: &Path, dest: &Path, guard: &SyncGuard) -> Result<(), Sy
     Ok(())
 }
 
-/// Delete a file, marking the guard before removal.
 pub fn sync_delete(target: &Path, guard: &SyncGuard) -> Result<(), SyncError> {
     if target.exists() {
         guard.mark(target);
@@ -99,7 +93,6 @@ pub fn sync_delete(target: &Path, guard: &SyncGuard) -> Result<(), SyncError> {
     Ok(())
 }
 
-/// Perform initial sync for a pair: walk both sides, compare mtimes, sync differences.
 pub fn initial_sync(
     pair: &ResolvedPair,
     guard: &SyncGuard,
@@ -110,7 +103,6 @@ pub fn initial_sync(
     let a_files = collect_matching_files(&pair.a_base, &pair.a_glob, gi_cache);
     let b_files = collect_matching_files(&pair.b_base, &pair.b_glob, gi_cache);
 
-    // Collect all relative paths from both sides
     let mut all_keys: std::collections::HashSet<&PathBuf> = a_files.keys().collect();
     all_keys.extend(b_files.keys());
 
@@ -358,11 +350,9 @@ mod tests {
         let dir_a = TempDir::new().unwrap();
         let dir_b = TempDir::new().unwrap();
 
-        // Write to A first
         fs::write(dir_a.path().join("file.md"), "old from A").unwrap();
         // Small sleep to ensure different mtime
         thread::sleep(Duration::from_millis(50));
-        // Write to B second (newer)
         fs::write(dir_b.path().join("file.md"), "new from B").unwrap();
 
         let pair = make_pair(dir_a.path(), dir_b.path(), "*.md", false);

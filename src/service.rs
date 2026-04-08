@@ -70,8 +70,6 @@ pub fn reload() -> Result<(), ServiceError> {
     }
 }
 
-// --- PID file ---
-
 fn pid_file_path() -> Result<PathBuf, ServiceError> {
     let home = home_dir()?;
     Ok(home.join(".config/bsync/bsync.pid"))
@@ -100,7 +98,6 @@ fn reload_from_pid_file() -> Result<(), ServiceError> {
         .parse()
         .map_err(|_| ServiceError::PidNotFound)?;
 
-    // Check if the process is still running
     let ret = unsafe { libc::kill(pid, 0) };
     if ret != 0 {
         let _ = fs::remove_file(&path);
@@ -116,8 +113,6 @@ fn reload_from_pid_file() -> Result<(), ServiceError> {
     }
     Ok(())
 }
-
-// --- macOS launchd ---
 
 fn launchd_plist_path() -> Result<PathBuf, ServiceError> {
     let home = home_dir()?;
@@ -166,7 +161,6 @@ fn generate_plist_content(binary_path: &Path, config_path: &Path) -> String {
 fn install_launchd(binary_path: &Path, config_path: &Path) -> Result<(), ServiceError> {
     let plist_path = launchd_plist_path()?;
 
-    // Ensure LaunchAgents directory exists
     if let Some(parent) = plist_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -209,7 +203,6 @@ fn uninstall_launchd() -> Result<(), ServiceError> {
 }
 
 fn reload_launchd() -> Result<(), ServiceError> {
-    // Find PID via launchctl and send SIGHUP
     let output = Command::new("launchctl").args(["list", LABEL]).output()?;
 
     if !output.status.success() {
@@ -237,8 +230,6 @@ fn reload_launchd() -> Result<(), ServiceError> {
 
     Err(ServiceError::PidNotFound)
 }
-
-// --- Linux systemd ---
 
 fn systemd_unit_path() -> Result<PathBuf, ServiceError> {
     let home = home_dir()?;

@@ -4,8 +4,6 @@ use std::time::{Duration, Instant};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use walkdir::WalkDir;
 
-/// TTL-cached union gitignore matcher for a sync pair.
-/// Holds matchers for both sides; a file ignored on either side is skipped everywhere.
 pub struct GitignoreCache {
     a_base: PathBuf,
     b_base: PathBuf,
@@ -29,8 +27,6 @@ impl GitignoreCache {
         }
     }
 
-    /// Returns true if the relative path is gitignored on either side (union semantics).
-    /// Rebuilds matchers if TTL has expired.
     pub fn is_ignored(&mut self, relative: &Path) -> bool {
         if self.built_at.elapsed() > self.ttl {
             self.rebuild();
@@ -46,12 +42,9 @@ impl GitignoreCache {
     }
 }
 
-/// Build a gitignore matcher for a directory by collecting all .gitignore files
-/// within it and walking up parent directories.
 fn build_gitignore(base: &Path) -> Gitignore {
     let mut builder = GitignoreBuilder::new(base);
 
-    // Walk up parent directories for parent .gitignore files
     let mut ancestor = base.parent();
     while let Some(dir) = ancestor {
         let gi = dir.join(".gitignore");
@@ -61,7 +54,6 @@ fn build_gitignore(base: &Path) -> Gitignore {
         ancestor = dir.parent();
     }
 
-    // Collect nested .gitignore files within the base
     for entry in WalkDir::new(base).into_iter().filter_map(|e| e.ok()) {
         if entry.file_name() == ".gitignore" {
             builder.add(entry.path());
@@ -86,8 +78,6 @@ mod tests {
         let dir_b = TempDir::new().unwrap();
 
         fs::write(dir_a.path().join(".gitignore"), "*.log\n").unwrap();
-        // No .gitignore on side B
-
         let mut cache = GitignoreCache::new(dir_a.path().to_path_buf(), dir_b.path().to_path_buf());
 
         assert!(cache.is_ignored(Path::new("debug.log")));
@@ -99,7 +89,6 @@ mod tests {
         let dir_a = TempDir::new().unwrap();
         let dir_b = TempDir::new().unwrap();
 
-        // No .gitignore on side A
         fs::write(dir_b.path().join(".gitignore"), "*.bin\n").unwrap();
 
         let mut cache = GitignoreCache::new(dir_a.path().to_path_buf(), dir_b.path().to_path_buf());
@@ -123,9 +112,7 @@ mod tests {
         let dir_a = TempDir::new().unwrap();
         let dir_b = TempDir::new().unwrap();
 
-        // Root .gitignore ignores *.log
         fs::write(dir_a.path().join(".gitignore"), "*.log\n").unwrap();
-        // Nested .gitignore in sub/ ignores *.tmp
         let sub = dir_a.path().join("sub");
         fs::create_dir_all(&sub).unwrap();
         fs::write(sub.join(".gitignore"), "*.tmp\n").unwrap();
@@ -148,7 +135,6 @@ mod tests {
 
         assert!(!cache.is_ignored(Path::new("test.log")));
 
-        // Add a .gitignore after cache was built
         fs::write(dir_a.path().join(".gitignore"), "*.log\n").unwrap();
 
         // Next call should rebuild and pick up the new rule

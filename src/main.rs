@@ -211,7 +211,6 @@ fn run_sync_loop(config_path: &Path) {
     let mut _watchers;
 
     'reload: loop {
-        // Build gitignore caches for glob pairs
         let gi_caches: Vec<Option<Arc<Mutex<gitignore::GitignoreCache>>>> = pairs
             .iter()
             .map(|pair| {
@@ -235,7 +234,6 @@ fn run_sync_loop(config_path: &Path) {
             }
         };
 
-        // Initial sync
         for (pair, gi_cache) in pairs.iter().zip(gi_caches.iter()) {
             if let Err(e) = sync::initial_sync(pair, &guard, gi_cache.as_ref()) {
                 tracing::error!(

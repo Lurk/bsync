@@ -79,7 +79,6 @@ pub fn setup_watchers(
     for (idx, pair) in pairs.iter().enumerate() {
         let gi_cache = gi_caches[idx].clone();
 
-        // Watcher for side A
         let watcher_a = notify::recommended_watcher(make_handler(
             idx,
             Side::A,
@@ -90,7 +89,6 @@ pub fn setup_watchers(
         ))?;
         watchers.push(watcher_a);
 
-        // Watcher for side B
         let watcher_b = notify::recommended_watcher(make_handler(
             idx,
             Side::B,
@@ -102,7 +100,6 @@ pub fn setup_watchers(
         watchers.push(watcher_b);
     }
 
-    // Start watching after all watchers are created
     for (idx, pair) in pairs.iter().enumerate() {
         watchers[idx * 2].watch(&pair.a_base, RecursiveMode::Recursive)?;
         watchers[idx * 2 + 1].watch(&pair.b_base, RecursiveMode::Recursive)?;

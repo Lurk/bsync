@@ -60,8 +60,6 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// Extract the static directory prefix from a glob pattern.
-/// Walks path components until hitting the first glob metacharacter.
 pub fn extract_watch_root(pattern: &str) -> PathBuf {
     let path = Path::new(pattern);
     let mut root = PathBuf::new();
@@ -78,7 +76,6 @@ pub fn extract_watch_root(pattern: &str) -> PathBuf {
     root
 }
 
-/// Extract the glob suffix (the part after the static root).
 fn extract_glob_suffix(pattern: &str) -> String {
     let path = Path::new(pattern);
     let mut found_glob = false;
@@ -97,7 +94,6 @@ fn extract_glob_suffix(pattern: &str) -> String {
     suffix_parts.join("/")
 }
 
-/// Expand leading `~` or `~/` to the user's home directory.
 fn expand_tilde(path: &str) -> String {
     if (path == "~" || path.starts_with("~/"))
         && let Ok(home) = std::env::var("HOME")
@@ -167,7 +163,6 @@ fn resolve_pairs(pairs: &[PairConfig]) -> Result<Vec<ResolvedPair>, ConfigError>
     Ok(resolved)
 }
 
-/// Print validation summary for a config file.
 pub fn validate_and_print(path: &Path) -> Result<(), ConfigError> {
     let pairs = load(path)?;
 
@@ -221,9 +216,6 @@ pub fn default_config_path() -> PathBuf {
         .join("config.toml")
 }
 
-/// Canonicalize a glob pattern by resolving the static prefix to an absolute path.
-/// Expands `~`, then canonicalizes the watch root (resolving `.`, `..`, symlinks),
-/// and reattaches the glob suffix.
 fn canonicalize_pattern(pattern: &str) -> Result<String, ConfigError> {
     let expanded = expand_tilde(pattern);
     let root = extract_watch_root(&expanded);
@@ -240,7 +232,6 @@ pub fn add_pair(path: &Path, a: &str, b: &str, sync_deletions: bool) -> Result<(
     let a_canonical = canonicalize_pattern(a)?;
     let b_canonical = canonicalize_pattern(b)?;
 
-    // Validate the pair before persisting
     let check = PairConfig {
         a: a_canonical.clone(),
         b: b_canonical.clone(),
