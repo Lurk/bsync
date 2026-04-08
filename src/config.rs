@@ -221,11 +221,29 @@ pub fn default_config_path() -> PathBuf {
         .join("config.toml")
 }
 
-pub fn add_pair(path: &Path, a: &str, b: &str, sync_deletions: bool) -> Result<(), ConfigError> {
+/// Canonicalize a glob pattern by resolving the static prefix to an absolute path.
+/// Expands `~`, then canonicalizes the watch root (resolving `.`, `..`, symlinks),
+/// and reattaches the glob suffix.
+fn canonicalize_pattern(pattern: &str) -> Result<String, ConfigError> {
+    let expanded = expand_tilde(pattern);
+    let root = extract_watch_root(&expanded);
+    let suffix = extract_glob_suffix(&expanded);
+    let canonical_root = std::fs::canonicalize(&root).map_err(ConfigError::Io)?;
+    if suffix.is_empty() {
+        Ok(canonical_root.display().to_string())
+    } else {
+        Ok(format!("{}/{}", canonical_root.display(), suffix))
+    }
+}
+
+pub fn add_pair(path: &Path, a: &str, b: &str, sync_deletions: bool) -> Result<(String, String), ConfigError> {
+    let a_canonical = canonicalize_pattern(a)?;
+    let b_canonical = canonicalize_pattern(b)?;
+
     // Validate the pair before persisting
     let check = PairConfig {
-        a: a.to_string(),
-        b: b.to_string(),
+        a: a_canonical.clone(),
+        b: b_canonical.clone(),
         sync_deletions,
     };
     resolve_pairs(std::slice::from_ref(&check))?;
@@ -245,7 +263,7 @@ pub fn add_pair(path: &Path, a: &str, b: &str, sync_deletions: bool) -> Result<(
     let content = toml::to_string_pretty(&config).expect("Failed to serialize config");
     std::fs::write(path, content).map_err(ConfigError::Io)?;
 
-    Ok(())
+    Ok((a_canonical, b_canonical))
 }
 
 fn count_matching_files(

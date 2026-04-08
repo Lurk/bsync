@@ -107,6 +107,7 @@ fn main() {
         }
         Commands::Validate { config } => {
             let _guard = init_logging(false);
+            println!("Config: {}", config.display());
             match config::validate_and_print(&config) {
                 Ok(()) => {
                     println!("Config is valid.");
@@ -147,8 +148,8 @@ fn main() {
             let a_str = a.display().to_string();
             let b_str = b.display().to_string();
             match config::add_pair(&config, &a_str, &b_str, delete) {
-                Ok(()) => {
-                    println!("Added pair: {} <-> {}", a_str, b_str);
+                Ok((a_resolved, b_resolved)) => {
+                    println!("Added pair: {} <-> {}", a_resolved, b_resolved);
                     println!("Config: {}", config.display());
                 }
                 Err(e) => {
