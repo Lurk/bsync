@@ -18,6 +18,8 @@ pub struct PairConfig {
     pub b: String,
     #[serde(default)]
     pub sync_deletions: bool,
+    #[serde(default)]
+    pub allow_empty_sync: bool,
 }
 
 pub struct ResolvedPair {
@@ -28,6 +30,7 @@ pub struct ResolvedPair {
     pub a_pattern: String,
     pub b_pattern: String,
     pub sync_deletions: bool,
+    pub allow_empty_sync: bool,
     pub has_glob: bool,
 }
 
@@ -39,6 +42,7 @@ pub enum ConfigError {
     MismatchedGlobSuffix { a: String, b: String },
     WatchRootNotFound(PathBuf),
     NoPairs,
+    InvalidPairNumber { given: usize, max: usize },
 }
 
 impl fmt::Display for ConfigError {
@@ -54,6 +58,9 @@ impl fmt::Display for ConfigError {
                 write!(f, "Watch root directory not found: {}", p.display())
             }
             ConfigError::NoPairs => write!(f, "Config must contain at least one [[pair]]"),
+            ConfigError::InvalidPairNumber { given, max } => {
+                write!(f, "Invalid pair number {given}: config has {max} pair(s)")
+            }
         }
     }
 }
@@ -156,6 +163,7 @@ fn resolve_pairs(pairs: &[PairConfig]) -> Result<Vec<ResolvedPair>, ConfigError>
             a_pattern: a_expanded,
             b_pattern: b_expanded,
             sync_deletions: pair.sync_deletions,
+            allow_empty_sync: pair.allow_empty_sync,
             has_glob,
         });
     }
@@ -178,6 +186,7 @@ pub fn validate_and_print(path: &Path) -> Result<(), ConfigError> {
         println!("    Exists: {}", pair.b_base.is_dir());
 
         println!("  sync_deletions: {}", pair.sync_deletions);
+        println!("  allow_empty_sync: {}", pair.allow_empty_sync);
         println!(
             "  gitignore filtering: {}",
             if pair.has_glob { "enabled" } else { "disabled" }
@@ -228,7 +237,13 @@ fn canonicalize_pattern(pattern: &str) -> Result<String, ConfigError> {
     }
 }
 
-pub fn add_pair(path: &Path, a: &str, b: &str, sync_deletions: bool) -> Result<(String, String), ConfigError> {
+pub fn add_pair(
+    path: &Path,
+    a: &str,
+    b: &str,
+    sync_deletions: bool,
+    allow_empty_sync: bool,
+) -> Result<(String, String), ConfigError> {
     let a_canonical = canonicalize_pattern(a)?;
     let b_canonical = canonicalize_pattern(b)?;
 
@@ -236,6 +251,7 @@ pub fn add_pair(path: &Path, a: &str, b: &str, sync_deletions: bool) -> Result<(
         a: a_canonical.clone(),
         b: b_canonical.clone(),
         sync_deletions,
+        allow_empty_sync,
     };
     resolve_pairs(std::slice::from_ref(&check))?;
 
@@ -255,6 +271,25 @@ pub fn add_pair(path: &Path, a: &str, b: &str, sync_deletions: bool) -> Result<(
     std::fs::write(path, content).map_err(ConfigError::Io)?;
 
     Ok((a_canonical, b_canonical))
+}
+
+pub fn remove_pair(path: &Path, number: usize) -> Result<PairConfig, ConfigError> {
+    let content = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
+    let mut config: Config = toml::from_str(&content).map_err(ConfigError::Parse)?;
+
+    if number == 0 || number > config.pair.len() {
+        return Err(ConfigError::InvalidPairNumber {
+            given: number,
+            max: config.pair.len(),
+        });
+    }
+
+    let removed = config.pair.remove(number - 1);
+
+    let content = toml::to_string_pretty(&config).expect("Failed to serialize config");
+    std::fs::write(path, content).map_err(ConfigError::Io)?;
+
+    Ok(removed)
 }
 
 fn count_matching_files(
@@ -404,7 +439,7 @@ mod tests {
         let a_pattern = format!("{}/**/*.md", dir_a.display());
         let b_pattern = format!("{}/**/*.md", dir_b.display());
 
-        add_pair(&config_path, &a_pattern, &b_pattern, false).unwrap();
+        add_pair(&config_path, &a_pattern, &b_pattern, false, false).unwrap();
 
         assert!(config_path.exists());
         let pairs = load(&config_path).unwrap();
@@ -426,14 +461,67 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         let a1 = format!("{}/**/*.md", dir_a.display());
         let b1 = format!("{}/**/*.md", dir_b.display());
-        add_pair(&config_path, &a1, &b1, false).unwrap();
+        add_pair(&config_path, &a1, &b1, false, false).unwrap();
 
         let a2 = format!("{}/**/*.txt", dir_c.display());
         let b2 = format!("{}/**/*.txt", dir_d.display());
-        add_pair(&config_path, &a2, &b2, true).unwrap();
+        add_pair(&config_path, &a2, &b2, true, false).unwrap();
 
         let pairs = load(&config_path).unwrap();
         assert_eq!(pairs.len(), 2);
         assert!(pairs[1].sync_deletions);
+    }
+
+    #[test]
+    fn test_remove_pair() {
+        let dir = TempDir::new().unwrap();
+        let dir_a = dir.path().join("a");
+        let dir_b = dir.path().join("b");
+        let dir_c = dir.path().join("c");
+        let dir_d = dir.path().join("d");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+        fs::create_dir_all(&dir_c).unwrap();
+        fs::create_dir_all(&dir_d).unwrap();
+
+        let config_path = dir.path().join("config.toml");
+        let a1 = format!("{}/**/*.md", dir_a.display());
+        let b1 = format!("{}/**/*.md", dir_b.display());
+        add_pair(&config_path, &a1, &b1, false, false).unwrap();
+
+        let a2 = format!("{}/**/*.txt", dir_c.display());
+        let b2 = format!("{}/**/*.txt", dir_d.display());
+        add_pair(&config_path, &a2, &b2, true, false).unwrap();
+
+        let removed = remove_pair(&config_path, 1).unwrap();
+        assert!(removed.a.contains("a/"));
+
+        let content = fs::read_to_string(&config_path).unwrap();
+        let config: Config = toml::from_str(&content).unwrap();
+        assert_eq!(config.pair.len(), 1);
+        assert!(config.pair[0].sync_deletions);
+    }
+
+    #[test]
+    fn test_remove_pair_invalid_number() {
+        let dir = TempDir::new().unwrap();
+        let dir_a = dir.path().join("a");
+        let dir_b = dir.path().join("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        let config_path = dir.path().join("config.toml");
+        let a = format!("{}/**/*.md", dir_a.display());
+        let b = format!("{}/**/*.md", dir_b.display());
+        add_pair(&config_path, &a, &b, false, false).unwrap();
+
+        assert!(matches!(
+            remove_pair(&config_path, 0),
+            Err(ConfigError::InvalidPairNumber { given: 0, max: 1 })
+        ));
+        assert!(matches!(
+            remove_pair(&config_path, 2),
+            Err(ConfigError::InvalidPairNumber { given: 2, max: 1 })
+        ));
     }
 }

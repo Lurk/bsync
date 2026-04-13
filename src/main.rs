@@ -52,6 +52,17 @@ enum Commands {
         /// Sync deletions
         #[arg(long)]
         delete: bool,
+        /// Allow syncing empty files over non-empty files
+        #[arg(long)]
+        allow_empty_sync: bool,
+        /// Path to config file
+        #[arg(long, default_value_os_t = config::default_config_path())]
+        config: PathBuf,
+    },
+    /// Remove a sync pair from the config by number (as shown by validate)
+    Remove {
+        /// Pair number to remove (as shown by `bsync validate`)
+        number: usize,
         /// Path to config file
         #[arg(long, default_value_os_t = config::default_config_path())]
         config: PathBuf,
@@ -142,18 +153,32 @@ fn main() {
             a,
             b,
             delete,
+            allow_empty_sync,
             config,
         } => {
             let _guard = init_logging(false);
             let a_str = a.display().to_string();
             let b_str = b.display().to_string();
-            match config::add_pair(&config, &a_str, &b_str, delete) {
+            match config::add_pair(&config, &a_str, &b_str, delete, allow_empty_sync) {
                 Ok((a_resolved, b_resolved)) => {
                     println!("Added pair: {} <-> {}", a_resolved, b_resolved);
                     println!("Config: {}", config.display());
                 }
                 Err(e) => {
                     eprintln!("Failed to add pair: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Remove { number, config } => {
+            let _guard = init_logging(false);
+            match config::remove_pair(&config, number) {
+                Ok(removed) => {
+                    println!("Removed pair #{}: {} <-> {}", number, removed.a, removed.b);
+                    println!("Config: {}", config.display());
+                }
+                Err(e) => {
+                    eprintln!("Failed to remove pair: {e}");
                     std::process::exit(1);
                 }
             }
@@ -262,7 +287,9 @@ fn run_sync_loop(config_path: &Path) {
 
                     match event.kind {
                         watcher::SyncEventKind::CreateOrModify => {
-                            if let Err(e) = sync::sync_file(source, &dest, &guard) {
+                            if let Err(e) =
+                                sync::sync_file(source, &dest, &guard, pair.allow_empty_sync)
+                            {
                                 tracing::error!(
                                     "Sync failed {} -> {}: {e}",
                                     source.display(),

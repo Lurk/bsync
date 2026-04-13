@@ -24,6 +24,14 @@ The `--delete` flag enables deletion syncing:
 bsync add -a '/path/a/**/*.txt' -b '/path/b/**/*.txt' --delete
 ```
 
+### Remove a sync pair
+
+```
+bsync remove 2
+```
+
+The number corresponds to the pair numbering shown by `bsync validate`.
+
 ### Validate config
 
 ```
@@ -81,6 +89,7 @@ sync_deletions = false
 a = "/srv/app/config/**/*.yaml"
 b = "/backup/config/**/*.yaml"
 sync_deletions = true
+allow_empty_sync = true
 ```
 
 Each pair defines two glob patterns. The static prefix (everything before the first glob metacharacter) is the watched root directory. The glob suffix filters which files get synced.
@@ -101,6 +110,21 @@ When a sync pair uses glob patterns, bsync automatically respects `.gitignore` r
 - **Plain path pairs** (no glob metacharacters) do not check `.gitignore`.
 - Parent and nested `.gitignore` files are all respected.
 - Rules are refreshed automatically (1-second cache) — no restart needed after `.gitignore` edits.
+
+## Cloud storage compatibility
+
+Cloud storage providers like iCloud can evict inactive files, replacing them with 0-byte placeholders on disk. Without protection, bsync would copy these empty placeholders over the good copies on the other side.
+
+By default, bsync will **not** overwrite a non-empty file with a 0-byte source. This protection is on for all pairs. If a sync is skipped for this reason, a warning is logged.
+
+To disable this protection for a specific pair (e.g., if you need to sync intentionally emptied files), set `allow_empty_sync = true`:
+
+```toml
+[[pair]]
+a = "~/data/**/*.csv"
+b = "~/backup/**/*.csv"
+allow_empty_sync = true
+```
 
 ## Development
 

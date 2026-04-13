@@ -74,7 +74,27 @@ impl From<std::io::Error> for SyncError {
     }
 }
 
-pub fn sync_file(source: &Path, dest: &Path, guard: &SyncGuard) -> Result<(), SyncError> {
+pub fn sync_file(
+    source: &Path,
+    dest: &Path,
+    guard: &SyncGuard,
+    allow_empty_sync: bool,
+) -> Result<(), SyncError> {
+    if !allow_empty_sync {
+        let source_size = fs::metadata(source)?.len();
+        if source_size == 0
+            && let Ok(dest_meta) = fs::metadata(dest)
+            && dest_meta.len() > 0
+        {
+            tracing::warn!(
+                "Skipping sync of empty file {} over non-empty {} (allow_empty_sync=false)",
+                source.display(),
+                dest.display()
+            );
+            return Ok(());
+        }
+    }
+
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -113,21 +133,21 @@ pub fn initial_sync(
         match (a_entry, b_entry) {
             (Some(a_path), None) => {
                 let b_dest = pair.b_base.join(relative);
-                sync_file(a_path, &b_dest, guard)?;
+                sync_file(a_path, &b_dest, guard, pair.allow_empty_sync)?;
             }
             (None, Some(b_path)) => {
                 let a_dest = pair.a_base.join(relative);
-                sync_file(b_path, &a_dest, guard)?;
+                sync_file(b_path, &a_dest, guard, pair.allow_empty_sync)?;
             }
             (Some(a_path), Some(b_path)) => {
                 let a_mtime = fs::metadata(a_path)?.modified()?;
                 let b_mtime = fs::metadata(b_path)?.modified()?;
                 if a_mtime > b_mtime {
                     let b_dest = pair.b_base.join(relative);
-                    sync_file(a_path, &b_dest, guard)?;
+                    sync_file(a_path, &b_dest, guard, pair.allow_empty_sync)?;
                 } else if b_mtime > a_mtime {
                     let a_dest = pair.a_base.join(relative);
-                    sync_file(b_path, &a_dest, guard)?;
+                    sync_file(b_path, &a_dest, guard, pair.allow_empty_sync)?;
                 }
             }
             (None, None) => unreachable!(),
@@ -198,6 +218,7 @@ mod tests {
             a_pattern,
             b_pattern,
             sync_deletions,
+            allow_empty_sync: false,
             has_glob: true,
         }
     }
@@ -245,7 +266,7 @@ mod tests {
         fs::write(&src, "hello world").unwrap();
 
         let guard = SyncGuard::new(Duration::from_secs(2));
-        sync_file(&src, &dest, &guard).unwrap();
+        sync_file(&src, &dest, &guard, false).unwrap();
 
         assert_eq!(fs::read_to_string(&dest).unwrap(), "hello world");
         assert!(guard.is_echo(&dest));
@@ -259,7 +280,7 @@ mod tests {
         fs::write(&src, "nested").unwrap();
 
         let guard = SyncGuard::new(Duration::from_secs(2));
-        sync_file(&src, &dest, &guard).unwrap();
+        sync_file(&src, &dest, &guard, false).unwrap();
 
         assert_eq!(fs::read_to_string(&dest).unwrap(), "nested");
     }
@@ -271,7 +292,7 @@ mod tests {
         let dest = dir.path().join("dest.txt");
 
         let guard = SyncGuard::new(Duration::from_secs(2));
-        let result = sync_file(&src, &dest, &guard);
+        let result = sync_file(&src, &dest, &guard, false);
         assert!(result.is_err());
     }
 
@@ -364,5 +385,60 @@ mod tests {
             fs::read_to_string(dir_a.path().join("file.md")).unwrap(),
             "new from B"
         );
+    }
+
+    #[test]
+    fn test_sync_file_skips_empty_over_nonempty() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("empty.txt");
+        let dest = dir.path().join("has_content.txt");
+        fs::write(&src, "").unwrap();
+        fs::write(&dest, "important content").unwrap();
+
+        let guard = SyncGuard::new(Duration::from_secs(2));
+        sync_file(&src, &dest, &guard, false).unwrap();
+
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "important content");
+    }
+
+    #[test]
+    fn test_sync_file_allows_empty_over_nonempty_when_flag_set() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("empty.txt");
+        let dest = dir.path().join("has_content.txt");
+        fs::write(&src, "").unwrap();
+        fs::write(&dest, "will be overwritten").unwrap();
+
+        let guard = SyncGuard::new(Duration::from_secs(2));
+        sync_file(&src, &dest, &guard, true).unwrap();
+
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "");
+    }
+
+    #[test]
+    fn test_sync_file_allows_empty_to_nonexistent_dest() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("empty.txt");
+        let dest = dir.path().join("new_file.txt");
+        fs::write(&src, "").unwrap();
+
+        let guard = SyncGuard::new(Duration::from_secs(2));
+        sync_file(&src, &dest, &guard, false).unwrap();
+
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "");
+    }
+
+    #[test]
+    fn test_sync_file_normal_copy_with_protection_on() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("source.txt");
+        let dest = dir.path().join("dest.txt");
+        fs::write(&src, "new content").unwrap();
+        fs::write(&dest, "old content").unwrap();
+
+        let guard = SyncGuard::new(Duration::from_secs(2));
+        sync_file(&src, &dest, &guard, false).unwrap();
+
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new content");
     }
 }
