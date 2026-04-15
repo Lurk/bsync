@@ -74,6 +74,17 @@ impl From<std::io::Error> for SyncError {
     }
 }
 
+fn temp_path_for(dest: &Path) -> PathBuf {
+    let file_name = dest
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("unknown"));
+    let temp_name = format!(".{}.bsync.tmp", file_name.to_string_lossy());
+    match dest.parent() {
+        Some(parent) if parent != Path::new("") => parent.join(temp_name),
+        _ => PathBuf::from(temp_name),
+    }
+}
+
 pub fn sync_file(
     source: &Path,
     dest: &Path,
@@ -98,7 +109,36 @@ pub fn sync_file(
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::copy(source, dest)?;
+
+    let temp = temp_path_for(dest);
+
+    let copy_result = fs::copy(source, &temp);
+    if let Err(e) = copy_result {
+        let _ = fs::remove_file(&temp);
+        return Err(SyncError::Io(e));
+    }
+
+    if !allow_empty_sync {
+        let temp_size = fs::metadata(&temp).map(|m| m.len()).unwrap_or(0);
+        if temp_size == 0
+            && let Ok(dest_meta) = fs::metadata(dest)
+            && dest_meta.len() > 0
+        {
+            let _ = fs::remove_file(&temp);
+            tracing::warn!(
+                "Skipping sync of empty file {} over non-empty {} (allow_empty_sync=false)",
+                source.display(),
+                dest.display()
+            );
+            return Ok(());
+        }
+    }
+
+    if let Err(e) = fs::rename(&temp, dest) {
+        let _ = fs::remove_file(&temp);
+        return Err(SyncError::Io(e));
+    }
+
     guard.mark(dest);
     tracing::info!("Synced {} -> {}", source.display(), dest.display());
     Ok(())
@@ -440,5 +480,91 @@ mod tests {
         sync_file(&src, &dest, &guard, false).unwrap();
 
         assert_eq!(fs::read_to_string(&dest).unwrap(), "new content");
+    }
+
+    #[test]
+    fn test_temp_path_for_dest() {
+        let dest = Path::new("/some/dir/notes.md");
+        let temp = temp_path_for(dest);
+        assert_eq!(temp, PathBuf::from("/some/dir/.notes.md.bsync.tmp"));
+    }
+
+    #[test]
+    fn test_temp_path_for_dest_no_parent() {
+        let dest = Path::new("notes.md");
+        let temp = temp_path_for(dest);
+        assert_eq!(temp, PathBuf::from(".notes.md.bsync.tmp"));
+    }
+
+    #[test]
+    fn test_sync_file_does_not_corrupt_dest_on_copy_failure() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("source.txt");
+        let dest = dir.path().join("dest.txt");
+        fs::write(&src, "good content").unwrap();
+        fs::write(&dest, "original content").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&src, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+
+        let guard = SyncGuard::new(Duration::from_secs(2));
+        let result = sync_file(&src, &dest, &guard, false);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "original content");
+    }
+
+    #[test]
+    fn test_sync_file_cleans_up_temp_on_failure() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("source.txt");
+        let dest = dir.path().join("dest.txt");
+        fs::write(&src, "content").unwrap();
+        fs::write(&dest, "original").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&src, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+
+        let guard = SyncGuard::new(Duration::from_secs(2));
+        let _ = sync_file(&src, &dest, &guard, false);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let temp = temp_path_for(&dest);
+        assert!(!temp.exists(), "temp file should be cleaned up");
+    }
+
+    #[test]
+    fn test_sync_file_post_copy_protects_dest_when_temp_is_empty() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("source.txt");
+        let dest = dir.path().join("dest.txt");
+
+        fs::write(&src, "").unwrap();
+        fs::write(&dest, "precious content").unwrap();
+
+        let guard = SyncGuard::new(Duration::from_secs(2));
+        sync_file(&src, &dest, &guard, false).unwrap();
+
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "precious content");
+
+        let temp = temp_path_for(&dest);
+        assert!(!temp.exists());
     }
 }
