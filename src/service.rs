@@ -54,6 +54,14 @@ pub fn uninstall() -> Result<(), ServiceError> {
     }
 }
 
+pub fn restart() -> Result<(), ServiceError> {
+    if cfg!(target_os = "macos") {
+        restart_launchd()
+    } else {
+        restart_systemd()
+    }
+}
+
 pub fn reload() -> Result<(), ServiceError> {
     let service_result = if cfg!(target_os = "macos") {
         reload_launchd()
@@ -231,6 +239,23 @@ fn reload_launchd() -> Result<(), ServiceError> {
     Err(ServiceError::PidNotFound)
 }
 
+fn restart_launchd() -> Result<(), ServiceError> {
+    let uid = unsafe { libc::getuid() };
+    let target = format!("gui/{uid}/{LABEL}");
+
+    let output = Command::new("launchctl")
+        .args(["kickstart", "-k", &target])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(ServiceError::CommandFailed(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 fn systemd_unit_path() -> Result<PathBuf, ServiceError> {
     let home = home_dir()?;
     Ok(home.join(".config/systemd/user").join("bsync.service"))
@@ -297,6 +322,20 @@ fn uninstall_systemd() -> Result<(), ServiceError> {
         .output();
 
     tracing::info!("Removed systemd user service");
+    Ok(())
+}
+
+fn restart_systemd() -> Result<(), ServiceError> {
+    let output = Command::new("systemctl")
+        .args(["--user", "restart", "bsync"])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(ServiceError::CommandFailed(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ));
+    }
+
     Ok(())
 }
 

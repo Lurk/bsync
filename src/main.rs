@@ -71,6 +71,8 @@ enum Commands {
     Uninstall,
     /// Reload config (send SIGHUP to running daemon)
     Reload,
+    /// Restart the daemon (to pick up a new binary)
+    Restart,
 }
 
 fn init_logging(log_to_file: bool) -> Option<tracing_appender::non_blocking::WorkerGuard> {
@@ -199,6 +201,16 @@ fn main() {
                 Ok(()) => println!("Reload signal sent."),
                 Err(e) => {
                     eprintln!("Failed to send reload signal: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Restart => {
+            let _guard = init_logging(false);
+            match service::restart() {
+                Ok(()) => println!("Service restarted."),
+                Err(e) => {
+                    eprintln!("Failed to restart service: {e}");
                     std::process::exit(1);
                 }
             }
