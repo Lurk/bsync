@@ -1,5 +1,7 @@
 mod config;
+mod filename_map;
 mod gitignore;
+mod pipeline;
 mod service;
 mod sync;
 mod watcher;
@@ -55,6 +57,15 @@ enum Commands {
         /// Allow syncing empty files over non-empty files
         #[arg(long)]
         allow_empty_sync: bool,
+        /// Shell command (sh -c) that transforms an A-side file into B-side content (stdin -> stdout)
+        #[arg(long, requires = "b_to_a")]
+        a_to_b: Option<String>,
+        /// Shell command (sh -c) that transforms a B-side file into A-side content (stdin -> stdout)
+        #[arg(long, requires = "a_to_b")]
+        b_to_a: Option<String>,
+        /// Per-file timeout (seconds) for the pipeline command. Defaults to 300.
+        #[arg(long, requires = "a_to_b")]
+        pipeline_timeout_secs: Option<u64>,
         /// Path to config file
         #[arg(long, default_value_os_t = config::default_config_path())]
         config: PathBuf,
@@ -156,12 +167,24 @@ fn main() {
             b,
             delete,
             allow_empty_sync,
+            a_to_b,
+            b_to_a,
+            pipeline_timeout_secs,
             config,
         } => {
             let _guard = init_logging(false);
             let a_str = a.display().to_string();
             let b_str = b.display().to_string();
-            match config::add_pair(&config, &a_str, &b_str, delete, allow_empty_sync) {
+            match config::add_pair(
+                &config,
+                &a_str,
+                &b_str,
+                delete,
+                allow_empty_sync,
+                a_to_b,
+                b_to_a,
+                pipeline_timeout_secs,
+            ) {
                 Ok((a_resolved, b_resolved)) => {
                     println!("Added pair: {} <-> {}", a_resolved, b_resolved);
                     println!("Config: {}", config.display());
@@ -292,21 +315,60 @@ fn run_sync_loop(config_path: &Path) {
                     }
 
                     let pair = &pairs[event.pair_index];
-                    let (source, dest) = match event.side {
-                        watcher::Side::A => (&event.path, pair.b_base.join(&event.relative)),
-                        watcher::Side::B => (&event.path, pair.a_base.join(&event.relative)),
+                    let dest = match event.side {
+                        watcher::Side::A => pair.a_to_b_path(&event.relative),
+                        watcher::Side::B => pair.b_to_a_path(&event.relative),
+                    };
+                    let Some(dest) = dest else {
+                        tracing::debug!(
+                            "No mapping for {} (pattern mismatch)",
+                            event.path.display()
+                        );
+                        continue;
+                    };
+
+                    let pipeline = match (&pair.content, event.side) {
+                        (config::ContentTransform::Identity, _) => None,
+                        (
+                            config::ContentTransform::Command {
+                                a_to_b, timeout, ..
+                            },
+                            watcher::Side::A,
+                        ) => Some((a_to_b.as_str(), *timeout)),
+                        (
+                            config::ContentTransform::Command {
+                                b_to_a, timeout, ..
+                            },
+                            watcher::Side::B,
+                        ) => Some((b_to_a.as_str(), *timeout)),
                     };
 
                     match event.kind {
                         watcher::SyncEventKind::CreateOrModify => {
-                            if let Err(e) =
-                                sync::sync_file(source, &dest, &guard, pair.allow_empty_sync)
-                            {
-                                tracing::error!(
-                                    "Sync failed {} -> {}: {e}",
-                                    source.display(),
-                                    dest.display()
-                                );
+                            match sync::sync_file(
+                                &event.path,
+                                &dest,
+                                &guard,
+                                pair.allow_empty_sync,
+                                pipeline,
+                            ) {
+                                Ok(sync::SyncOutcome::Synced) => {}
+                                Ok(sync::SyncOutcome::SkippedEmpty) => {
+                                    if let Some((c, _)) = pipeline {
+                                        tracing::warn!(
+                                            "Pipeline command '{c}' produced empty output for {} -> {}; destination preserved",
+                                            event.path.display(),
+                                            dest.display()
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Sync failed {} -> {}: {e}",
+                                        event.path.display(),
+                                        dest.display()
+                                    );
+                                }
                             }
                         }
                         watcher::SyncEventKind::Delete => {

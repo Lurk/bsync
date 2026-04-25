@@ -3,9 +3,13 @@ use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use walkdir::WalkDir;
 
+use crate::filename_map::{FilenameMap, SuffixToken, tokenize_suffix, wildcard_shapes_compatible};
 use crate::gitignore::GitignoreCache;
+
+pub const DEFAULT_PIPELINE_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Deserialize, Serialize)]
 pub struct Config {
@@ -20,8 +24,15 @@ pub struct PairConfig {
     pub sync_deletions: bool,
     #[serde(default)]
     pub allow_empty_sync: bool,
+    #[serde(default)]
+    pub a_to_b: Option<String>,
+    #[serde(default)]
+    pub b_to_a: Option<String>,
+    #[serde(default)]
+    pub pipeline_timeout_secs: Option<u64>,
 }
 
+#[derive(Debug)]
 pub struct ResolvedPair {
     pub a_base: PathBuf,
     pub b_base: PathBuf,
@@ -32,6 +43,32 @@ pub struct ResolvedPair {
     pub sync_deletions: bool,
     pub allow_empty_sync: bool,
     pub has_glob: bool,
+    pub filename_map: FilenameMap,
+    pub content: ContentTransform,
+}
+
+impl ResolvedPair {
+    pub fn a_to_b_path(&self, rel: &Path) -> Option<PathBuf> {
+        self.filename_map
+            .map_a_to_b(rel)
+            .map(|other| self.b_base.join(other))
+    }
+
+    pub fn b_to_a_path(&self, rel: &Path) -> Option<PathBuf> {
+        self.filename_map
+            .map_b_to_a(rel)
+            .map(|other| self.a_base.join(other))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ContentTransform {
+    Identity,
+    Command {
+        a_to_b: String,
+        b_to_a: String,
+        timeout: Duration,
+    },
 }
 
 #[derive(Debug)]
@@ -39,10 +76,32 @@ pub enum ConfigError {
     Io(std::io::Error),
     Parse(toml::de::Error),
     InvalidGlob(String, globset::Error),
-    MismatchedGlobSuffix { a: String, b: String },
+    MismatchedGlobSuffix {
+        a: String,
+        b: String,
+    },
     WatchRootNotFound(PathBuf),
     NoPairs,
-    InvalidPairNumber { given: usize, max: usize },
+    InvalidPairNumber {
+        given: usize,
+        max: usize,
+    },
+    UnsupportedGlobFeature {
+        pattern: String,
+        reason: &'static str,
+    },
+    PipelineRequiresBothDirections {
+        a: String,
+        b: String,
+    },
+    InvalidPipelineTimeout {
+        a: String,
+        b: String,
+    },
+    PipelineTimeoutWithoutCommand {
+        a: String,
+        b: String,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -60,6 +119,27 @@ impl fmt::Display for ConfigError {
             ConfigError::NoPairs => write!(f, "Config must contain at least one [[pair]]"),
             ConfigError::InvalidPairNumber { given, max } => {
                 write!(f, "Invalid pair number {given}: config has {max} pair(s)")
+            }
+            ConfigError::UnsupportedGlobFeature { pattern, reason } => {
+                write!(f, "Unsupported glob feature in '{pattern}': {reason}")
+            }
+            ConfigError::PipelineRequiresBothDirections { a, b } => {
+                write!(
+                    f,
+                    "Both 'a_to_b' and 'b_to_a' must be set together (or neither) for pair '{a}' <-> '{b}'"
+                )
+            }
+            ConfigError::InvalidPipelineTimeout { a, b } => {
+                write!(
+                    f,
+                    "'pipeline_timeout_secs' must be > 0 for pair '{a}' <-> '{b}'"
+                )
+            }
+            ConfigError::PipelineTimeoutWithoutCommand { a, b } => {
+                write!(
+                    f,
+                    "'pipeline_timeout_secs' is set but no pipeline command is configured for pair '{a}' <-> '{b}'"
+                )
             }
         }
     }
@@ -129,12 +209,32 @@ fn resolve_pairs(pairs: &[PairConfig]) -> Result<Vec<ResolvedPair>, ConfigError>
 
         let a_suffix = extract_glob_suffix(&a_expanded);
         let b_suffix = extract_glob_suffix(&b_expanded);
-        if a_suffix != b_suffix {
-            return Err(ConfigError::MismatchedGlobSuffix {
-                a: pair.a.clone(),
-                b: pair.b.clone(),
-            });
-        }
+
+        // Tokenize both suffixes unconditionally so the documented restrictions
+        // (no '?', '[…]', '{…}'; well-formed '**') apply uniformly — even when
+        // the suffixes are identical and we'd otherwise short-circuit to Identity.
+        let a_tokens =
+            tokenize_suffix(&a_suffix).map_err(|reason| ConfigError::UnsupportedGlobFeature {
+                pattern: pair.a.clone(),
+                reason,
+            })?;
+        let b_tokens =
+            tokenize_suffix(&b_suffix).map_err(|reason| ConfigError::UnsupportedGlobFeature {
+                pattern: pair.b.clone(),
+                reason,
+            })?;
+
+        let filename_map = if a_suffix == b_suffix {
+            FilenameMap::Identity
+        } else {
+            if !wildcard_shapes_compatible(&a_tokens, &b_tokens) {
+                return Err(ConfigError::MismatchedGlobSuffix {
+                    a: pair.a.clone(),
+                    b: pair.b.clone(),
+                });
+            }
+            FilenameMap::build(&a_tokens, &b_tokens)
+        };
 
         let a_base = extract_watch_root(&a_expanded);
         let b_base = extract_watch_root(&b_expanded);
@@ -155,6 +255,40 @@ fn resolve_pairs(pairs: &[PairConfig]) -> Result<Vec<ResolvedPair>, ConfigError>
 
         let has_glob = !a_suffix.is_empty();
 
+        let content = match (pair.a_to_b.as_ref(), pair.b_to_a.as_ref()) {
+            (None, None) => {
+                if pair.pipeline_timeout_secs.is_some() {
+                    return Err(ConfigError::PipelineTimeoutWithoutCommand {
+                        a: pair.a.clone(),
+                        b: pair.b.clone(),
+                    });
+                }
+                ContentTransform::Identity
+            }
+            (Some(a_to_b), Some(b_to_a)) => {
+                let secs = pair
+                    .pipeline_timeout_secs
+                    .unwrap_or(DEFAULT_PIPELINE_TIMEOUT_SECS);
+                if secs == 0 {
+                    return Err(ConfigError::InvalidPipelineTimeout {
+                        a: pair.a.clone(),
+                        b: pair.b.clone(),
+                    });
+                }
+                ContentTransform::Command {
+                    a_to_b: a_to_b.clone(),
+                    b_to_a: b_to_a.clone(),
+                    timeout: Duration::from_secs(secs),
+                }
+            }
+            _ => {
+                return Err(ConfigError::PipelineRequiresBothDirections {
+                    a: pair.a.clone(),
+                    b: pair.b.clone(),
+                });
+            }
+        };
+
         resolved.push(ResolvedPair {
             a_base,
             b_base,
@@ -165,6 +299,8 @@ fn resolve_pairs(pairs: &[PairConfig]) -> Result<Vec<ResolvedPair>, ConfigError>
             sync_deletions: pair.sync_deletions,
             allow_empty_sync: pair.allow_empty_sync,
             has_glob,
+            filename_map,
+            content,
         });
     }
 
@@ -191,6 +327,31 @@ pub fn validate_and_print(path: &Path) -> Result<(), ConfigError> {
             "  gitignore filtering: {}",
             if pair.has_glob { "enabled" } else { "disabled" }
         );
+
+        match &pair.filename_map {
+            FilenameMap::Identity => println!("  filename mapping: identity"),
+            FilenameMap::Template { a_tokens, .. } => {
+                let n_wildcards = a_tokens
+                    .iter()
+                    .filter(|t| !matches!(t, SuffixToken::Literal(_)))
+                    .count();
+                println!("  filename mapping: template ({n_wildcards} wildcard(s))");
+            }
+        }
+
+        match &pair.content {
+            ContentTransform::Identity => println!("  content transform: identity"),
+            ContentTransform::Command {
+                a_to_b,
+                b_to_a,
+                timeout,
+            } => {
+                println!(
+                    "  content transform: command (a→b: \"{a_to_b}\", b→a: \"{b_to_a}\", timeout: {}s)",
+                    timeout.as_secs()
+                );
+            }
+        }
 
         let mut gi_cache = if pair.has_glob {
             Some(GitignoreCache::new(
@@ -237,12 +398,16 @@ fn canonicalize_pattern(pattern: &str) -> Result<String, ConfigError> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn add_pair(
     path: &Path,
     a: &str,
     b: &str,
     sync_deletions: bool,
     allow_empty_sync: bool,
+    a_to_b: Option<String>,
+    b_to_a: Option<String>,
+    pipeline_timeout_secs: Option<u64>,
 ) -> Result<(String, String), ConfigError> {
     let a_canonical = canonicalize_pattern(a)?;
     let b_canonical = canonicalize_pattern(b)?;
@@ -252,6 +417,9 @@ pub fn add_pair(
         b: b_canonical.clone(),
         sync_deletions,
         allow_empty_sync,
+        a_to_b: a_to_b.clone(),
+        b_to_a: b_to_a.clone(),
+        pipeline_timeout_secs,
     };
     resolve_pairs(std::slice::from_ref(&check))?;
 
@@ -399,7 +567,7 @@ mod tests {
 
         let config_path = dir.path().join("config.toml");
         let config_content = format!(
-            "[[pair]]\na = \"{}/**/*.md\"\nb = \"{}/**/*.txt\"\n",
+            "[[pair]]\na = \"{}/**/*.md\"\nb = \"{}/*.txt\"\n",
             dir_a.display(),
             dir_b.display()
         );
@@ -439,7 +607,17 @@ mod tests {
         let a_pattern = format!("{}/**/*.md", dir_a.display());
         let b_pattern = format!("{}/**/*.md", dir_b.display());
 
-        add_pair(&config_path, &a_pattern, &b_pattern, false, false).unwrap();
+        add_pair(
+            &config_path,
+            &a_pattern,
+            &b_pattern,
+            false,
+            false,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         assert!(config_path.exists());
         let pairs = load(&config_path).unwrap();
@@ -461,11 +639,11 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         let a1 = format!("{}/**/*.md", dir_a.display());
         let b1 = format!("{}/**/*.md", dir_b.display());
-        add_pair(&config_path, &a1, &b1, false, false).unwrap();
+        add_pair(&config_path, &a1, &b1, false, false, None, None, None).unwrap();
 
         let a2 = format!("{}/**/*.txt", dir_c.display());
         let b2 = format!("{}/**/*.txt", dir_d.display());
-        add_pair(&config_path, &a2, &b2, true, false).unwrap();
+        add_pair(&config_path, &a2, &b2, true, false, None, None, None).unwrap();
 
         let pairs = load(&config_path).unwrap();
         assert_eq!(pairs.len(), 2);
@@ -487,11 +665,11 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         let a1 = format!("{}/**/*.md", dir_a.display());
         let b1 = format!("{}/**/*.md", dir_b.display());
-        add_pair(&config_path, &a1, &b1, false, false).unwrap();
+        add_pair(&config_path, &a1, &b1, false, false, None, None, None).unwrap();
 
         let a2 = format!("{}/**/*.txt", dir_c.display());
         let b2 = format!("{}/**/*.txt", dir_d.display());
-        add_pair(&config_path, &a2, &b2, true, false).unwrap();
+        add_pair(&config_path, &a2, &b2, true, false, None, None, None).unwrap();
 
         let removed = remove_pair(&config_path, 1).unwrap();
         assert!(removed.a.contains("a/"));
@@ -513,7 +691,7 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         let a = format!("{}/**/*.md", dir_a.display());
         let b = format!("{}/**/*.md", dir_b.display());
-        add_pair(&config_path, &a, &b, false, false).unwrap();
+        add_pair(&config_path, &a, &b, false, false, None, None, None).unwrap();
 
         assert!(matches!(
             remove_pair(&config_path, 0),
@@ -523,5 +701,371 @@ mod tests {
             remove_pair(&config_path, 2),
             Err(ConfigError::InvalidPairNumber { given: 2, max: 1 })
         ));
+    }
+
+    #[test]
+    fn test_resolve_pairs_builds_filename_map() {
+        let dir = TempDir::new().unwrap();
+        let dir_a = dir.path().join("a");
+        let dir_b = dir.path().join("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        // Identity mapping
+        let pair_id = PairConfig {
+            a: format!("{}/**/*.md", dir_a.display()),
+            b: format!("{}/**/*.md", dir_b.display()),
+            sync_deletions: false,
+            allow_empty_sync: false,
+            a_to_b: None,
+            b_to_a: None,
+            pipeline_timeout_secs: None,
+        };
+        let pairs = resolve_pairs(std::slice::from_ref(&pair_id)).unwrap();
+        assert!(matches!(pairs[0].filename_map, FilenameMap::Identity));
+
+        // Template mapping (gzip-style)
+        let pair_tpl = PairConfig {
+            a: format!("{}/**/*.md", dir_a.display()),
+            b: format!("{}/**/*.md.gz", dir_b.display()),
+            sync_deletions: false,
+            allow_empty_sync: false,
+            a_to_b: None,
+            b_to_a: None,
+            pipeline_timeout_secs: None,
+        };
+        let pairs = resolve_pairs(std::slice::from_ref(&pair_tpl)).unwrap();
+        assert!(matches!(
+            pairs[0].filename_map,
+            FilenameMap::Template { .. }
+        ));
+    }
+
+    #[test]
+    fn test_pipeline_parses_both_directions() {
+        let dir = TempDir::new().unwrap();
+        let dir_a = dir.path().join("a");
+        let dir_b = dir.path().join("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        let config_path = dir.path().join("config.toml");
+        let content = format!(
+            r#"
+[[pair]]
+a = "{}/**/*.md"
+b = "{}/**/*.md.gz"
+a_to_b = "gzip -c"
+b_to_a = "gunzip -c"
+"#,
+            dir_a.display(),
+            dir_b.display()
+        );
+        fs::write(&config_path, content).unwrap();
+
+        let pairs = load(&config_path).unwrap();
+        match &pairs[0].content {
+            ContentTransform::Command {
+                a_to_b,
+                b_to_a,
+                timeout,
+            } => {
+                assert_eq!(a_to_b, "gzip -c");
+                assert_eq!(b_to_a, "gunzip -c");
+                assert_eq!(*timeout, Duration::from_secs(DEFAULT_PIPELINE_TIMEOUT_SECS));
+            }
+            ContentTransform::Identity => panic!("expected Command, got Identity"),
+        }
+    }
+
+    #[test]
+    fn test_pipeline_defaults_to_identity_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let dir_a = dir.path().join("a");
+        let dir_b = dir.path().join("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        let config_path = dir.path().join("config.toml");
+        let content = format!(
+            "[[pair]]\na = \"{}/**/*.md\"\nb = \"{}/**/*.md\"\n",
+            dir_a.display(),
+            dir_b.display()
+        );
+        fs::write(&config_path, content).unwrap();
+
+        let pairs = load(&config_path).unwrap();
+        assert!(matches!(pairs[0].content, ContentTransform::Identity));
+    }
+
+    #[test]
+    fn test_pipeline_requires_both_directions() {
+        let dir = TempDir::new().unwrap();
+        let dir_a = dir.path().join("a");
+        let dir_b = dir.path().join("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        let config_path = dir.path().join("config.toml");
+        let content = format!(
+            r#"
+[[pair]]
+a = "{}/**/*.md"
+b = "{}/**/*.md.gz"
+a_to_b = "gzip -c"
+"#,
+            dir_a.display(),
+            dir_b.display()
+        );
+        fs::write(&config_path, content).unwrap();
+
+        let err = load(&config_path).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::PipelineRequiresBothDirections { .. }
+        ));
+    }
+
+    #[test]
+    fn test_resolved_pair_path_methods_identity() {
+        let dir = TempDir::new().unwrap();
+        let dir_a = dir.path().join("a");
+        let dir_b = dir.path().join("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        let pair = PairConfig {
+            a: format!("{}/**/*.md", dir_a.display()),
+            b: format!("{}/**/*.md", dir_b.display()),
+            sync_deletions: false,
+            allow_empty_sync: false,
+            a_to_b: None,
+            b_to_a: None,
+            pipeline_timeout_secs: None,
+        };
+        let pairs = resolve_pairs(std::slice::from_ref(&pair)).unwrap();
+        let resolved = &pairs[0];
+
+        let rel = Path::new("notes/foo.md");
+        assert_eq!(
+            resolved.a_to_b_path(rel).unwrap(),
+            dir_b.join("notes/foo.md")
+        );
+        assert_eq!(
+            resolved.b_to_a_path(rel).unwrap(),
+            dir_a.join("notes/foo.md")
+        );
+    }
+
+    #[test]
+    fn test_add_pair_persists_pipeline_fields() {
+        let dir = TempDir::new().unwrap();
+        let dir_a = dir.path().join("a");
+        let dir_b = dir.path().join("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        let config_path = dir.path().join("config.toml");
+        let a_pattern = format!("{}/**/*.md", dir_a.display());
+        let b_pattern = format!("{}/**/*.md.gz", dir_b.display());
+        add_pair(
+            &config_path,
+            &a_pattern,
+            &b_pattern,
+            false,
+            false,
+            Some("gzip -c".into()),
+            Some("gunzip -c".into()),
+            None,
+        )
+        .unwrap();
+
+        let pairs = load(&config_path).unwrap();
+        match &pairs[0].content {
+            ContentTransform::Command {
+                a_to_b,
+                b_to_a,
+                timeout,
+            } => {
+                assert_eq!(a_to_b, "gzip -c");
+                assert_eq!(b_to_a, "gunzip -c");
+                assert_eq!(*timeout, Duration::from_secs(DEFAULT_PIPELINE_TIMEOUT_SECS));
+            }
+            _ => panic!("expected Command transform"),
+        }
+    }
+
+    #[test]
+    fn test_resolved_pair_path_methods_template_gzip() {
+        let dir = TempDir::new().unwrap();
+        let dir_a = dir.path().join("a");
+        let dir_b = dir.path().join("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        let pair = PairConfig {
+            a: format!("{}/**/*.md", dir_a.display()),
+            b: format!("{}/**/*.md.gz", dir_b.display()),
+            sync_deletions: false,
+            allow_empty_sync: false,
+            a_to_b: None,
+            b_to_a: None,
+            pipeline_timeout_secs: None,
+        };
+        let pairs = resolve_pairs(std::slice::from_ref(&pair)).unwrap();
+        let resolved = &pairs[0];
+
+        assert_eq!(
+            resolved.a_to_b_path(Path::new("foo.md")).unwrap(),
+            dir_b.join("foo.md.gz")
+        );
+        assert_eq!(
+            resolved.b_to_a_path(Path::new("sub/x.md.gz")).unwrap(),
+            dir_a.join("sub/x.md")
+        );
+    }
+
+    #[test]
+    fn test_pipeline_timeout_secs_overrides_default() {
+        let dir = TempDir::new().unwrap();
+        let dir_a = dir.path().join("a");
+        let dir_b = dir.path().join("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        let config_path = dir.path().join("config.toml");
+        let content = format!(
+            r#"
+[[pair]]
+a = "{}/**/*.md"
+b = "{}/**/*.md.gz"
+a_to_b = "gzip -c"
+b_to_a = "gunzip -c"
+pipeline_timeout_secs = 17
+"#,
+            dir_a.display(),
+            dir_b.display()
+        );
+        fs::write(&config_path, content).unwrap();
+
+        let pairs = load(&config_path).unwrap();
+        match &pairs[0].content {
+            ContentTransform::Command { timeout, .. } => {
+                assert_eq!(*timeout, Duration::from_secs(17));
+            }
+            ContentTransform::Identity => panic!("expected Command, got Identity"),
+        }
+    }
+
+    #[test]
+    fn test_pipeline_timeout_secs_zero_rejected() {
+        let dir = TempDir::new().unwrap();
+        let dir_a = dir.path().join("a");
+        let dir_b = dir.path().join("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        let config_path = dir.path().join("config.toml");
+        let content = format!(
+            r#"
+[[pair]]
+a = "{}/**/*.md"
+b = "{}/**/*.md.gz"
+a_to_b = "gzip -c"
+b_to_a = "gunzip -c"
+pipeline_timeout_secs = 0
+"#,
+            dir_a.display(),
+            dir_b.display()
+        );
+        fs::write(&config_path, content).unwrap();
+
+        let err = load(&config_path).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidPipelineTimeout { .. }));
+    }
+
+    // pipeline_timeout_secs without a_to_b/b_to_a is meaningless and almost
+    // always indicates a config typo — surface it instead of silently ignoring.
+    #[test]
+    fn test_pipeline_timeout_without_command_rejected() {
+        let dir = TempDir::new().unwrap();
+        let dir_a = dir.path().join("a");
+        let dir_b = dir.path().join("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        let config_path = dir.path().join("config.toml");
+        let content = format!(
+            r#"
+[[pair]]
+a = "{}/**/*.md"
+b = "{}/**/*.md"
+pipeline_timeout_secs = 30
+"#,
+            dir_a.display(),
+            dir_b.display()
+        );
+        fs::write(&config_path, content).unwrap();
+
+        let err = load(&config_path).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::PipelineTimeoutWithoutCommand { .. }
+        ));
+    }
+
+    // Identity mode (suffixes equal) used to skip tokenizing entirely, so
+    // configs with documented-as-rejected glob features (?, [...], {...}) were
+    // silently accepted. Validation must apply uniformly to both sides.
+    #[test]
+    fn test_load_rejects_unsupported_glob_feature_in_identity_mode() {
+        let dir = TempDir::new().unwrap();
+        let dir_a = dir.path().join("a");
+        let dir_b = dir.path().join("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        let config_path = dir.path().join("config.toml");
+        let content = format!(
+            "[[pair]]\na = \"{}/**/a?.md\"\nb = \"{}/**/a?.md\"\n",
+            dir_a.display(),
+            dir_b.display()
+        );
+        fs::write(&config_path, content).unwrap();
+
+        let err = load(&config_path).unwrap_err();
+        assert!(matches!(err, ConfigError::UnsupportedGlobFeature { .. }));
+    }
+
+    #[test]
+    fn test_add_pair_persists_pipeline_timeout() {
+        let dir = TempDir::new().unwrap();
+        let dir_a = dir.path().join("a");
+        let dir_b = dir.path().join("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        let config_path = dir.path().join("config.toml");
+        let a_pattern = format!("{}/**/*.md", dir_a.display());
+        let b_pattern = format!("{}/**/*.md.gz", dir_b.display());
+        add_pair(
+            &config_path,
+            &a_pattern,
+            &b_pattern,
+            false,
+            false,
+            Some("gzip -c".into()),
+            Some("gunzip -c".into()),
+            Some(42),
+        )
+        .unwrap();
+
+        let pairs = load(&config_path).unwrap();
+        match &pairs[0].content {
+            ContentTransform::Command { timeout, .. } => {
+                assert_eq!(*timeout, Duration::from_secs(42));
+            }
+            _ => panic!("expected Command transform"),
+        }
     }
 }
