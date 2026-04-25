@@ -3,56 +3,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use ignore::WalkBuilder;
 use walkdir::WalkDir;
 
 use crate::config::ResolvedPair;
 use crate::gitignore::GitignoreCache;
-
-pub struct SyncGuard {
-    recent: Mutex<HashMap<PathBuf, Instant>>,
-    ttl: Duration,
-}
-
-impl SyncGuard {
-    pub fn new(ttl: Duration) -> Self {
-        Self {
-            recent: Mutex::new(HashMap::new()),
-            ttl,
-        }
-    }
-
-    /// Resolve a path to its canonical form for consistent echo detection.
-    /// Falls back to the original path if canonicalization fails (e.g., file doesn't exist yet).
-    fn normalize(path: &Path) -> PathBuf {
-        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-    }
-
-    pub fn mark(&self, path: &Path) {
-        let canonical = Self::normalize(path);
-        self.recent
-            .lock()
-            .unwrap()
-            .insert(canonical, Instant::now());
-    }
-
-    pub fn is_echo(&self, path: &Path) -> bool {
-        let canonical = Self::normalize(path);
-        let map = self.recent.lock().unwrap();
-        if let Some(instant) = map.get(&canonical) {
-            instant.elapsed() < self.ttl
-        } else {
-            false
-        }
-    }
-
-    pub fn prune(&self) {
-        let mut map = self.recent.lock().unwrap();
-        map.retain(|_, instant| instant.elapsed() < self.ttl);
-    }
-}
 
 /// Outcome of a successful sync_file call. Distinguishes a real copy/transform
 /// from a no-op skip caused by empty-source/empty-output protection, so callers
@@ -126,10 +83,32 @@ fn temp_path_for(dest: &Path) -> PathBuf {
     }
 }
 
+/// Returns true iff both files exist and their mtimes are within 1 second.
+///
+/// Used as the runtime-loop dedup check: after every successful sync we
+/// preserve source mtime on dest, so source.mtime == dest.mtime is the
+/// steady-state invariant. Any echo event finds matching mtimes and
+/// short-circuits; a real user edit changes source mtime and triggers a
+/// real sync. The 1-second slack covers filesystems with second-resolution
+/// timestamps (HFS+); APFS / ext4 round-trip exactly.
+pub fn mtimes_match_within_slack(a: &Path, b: &Path) -> bool {
+    let Ok(am) = fs::metadata(a).and_then(|m| m.modified()) else {
+        return false;
+    };
+    let Ok(bm) = fs::metadata(b).and_then(|m| m.modified()) else {
+        return false;
+    };
+    let diff = if am > bm {
+        am.duration_since(bm)
+    } else {
+        bm.duration_since(am)
+    };
+    diff.map(|d| d < Duration::from_secs(1)).unwrap_or(false)
+}
+
 pub fn sync_file(
     source: &Path,
     dest: &Path,
-    guard: &SyncGuard,
     allow_empty_sync: bool,
     pipeline: Option<(&str, Duration)>,
 ) -> Result<SyncOutcome, SyncError> {
@@ -200,7 +179,6 @@ pub fn sync_file(
         tracing::warn!("Failed to preserve mtime on {}: {e}", dest.display());
     }
 
-    guard.mark(dest);
     tracing::info!("Synced {} -> {}", source.display(), dest.display());
     Ok(SyncOutcome::Synced)
 }
@@ -211,9 +189,8 @@ fn preserve_mtime(path: &Path, mtime: SystemTime) -> std::io::Result<()> {
     f.set_times(times)
 }
 
-pub fn sync_delete(target: &Path, guard: &SyncGuard) -> Result<(), SyncError> {
+pub fn sync_delete(target: &Path) -> Result<(), SyncError> {
     if target.exists() {
-        guard.mark(target);
         fs::remove_file(target)?;
         tracing::info!("Deleted {}", target.display());
     }
@@ -222,7 +199,6 @@ pub fn sync_delete(target: &Path, guard: &SyncGuard) -> Result<(), SyncError> {
 
 pub fn initial_sync(
     pair: &ResolvedPair,
-    guard: &SyncGuard,
     gi_cache: Option<&Arc<Mutex<GitignoreCache>>>,
 ) -> Result<(), SyncError> {
     tracing::info!("Initial sync: {} <-> {}", pair.a_pattern, pair.b_pattern);
@@ -267,7 +243,6 @@ pub fn initial_sync(
     let try_sync = |source: &Path, dest: &Path, pipeline: Option<(&str, Duration)>| match sync_file(
         source,
         dest,
-        guard,
         pair.allow_empty_sync,
         pipeline,
     ) {
@@ -427,52 +402,15 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_guard_mark_and_echo() {
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        let path = Path::new("/tmp/test_file.txt");
-
-        assert!(!guard.is_echo(path));
-        guard.mark(path);
-        assert!(guard.is_echo(path));
-    }
-
-    #[test]
-    fn test_sync_guard_ttl_expiry() {
-        let guard = SyncGuard::new(Duration::from_millis(50));
-        let path = Path::new("/tmp/test_file.txt");
-
-        guard.mark(path);
-        assert!(guard.is_echo(path));
-
-        thread::sleep(Duration::from_millis(100));
-        assert!(!guard.is_echo(path));
-    }
-
-    #[test]
-    fn test_sync_guard_prune() {
-        let guard = SyncGuard::new(Duration::from_millis(50));
-        guard.mark(Path::new("/tmp/a.txt"));
-        guard.mark(Path::new("/tmp/b.txt"));
-
-        thread::sleep(Duration::from_millis(100));
-        guard.prune();
-
-        let map = guard.recent.lock().unwrap();
-        assert!(map.is_empty());
-    }
-
-    #[test]
     fn test_sync_file_copies_content() {
         let dir = TempDir::new().unwrap();
         let src = dir.path().join("source.txt");
         let dest = dir.path().join("dest.txt");
         fs::write(&src, "hello world").unwrap();
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        sync_file(&src, &dest, &guard, false, None).unwrap();
+        sync_file(&src, &dest, false, None).unwrap();
 
         assert_eq!(fs::read_to_string(&dest).unwrap(), "hello world");
-        assert!(guard.is_echo(&dest));
     }
 
     #[test]
@@ -482,8 +420,7 @@ mod tests {
         let dest = dir.path().join("a/b/c/dest.txt");
         fs::write(&src, "nested").unwrap();
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        sync_file(&src, &dest, &guard, false, None).unwrap();
+        sync_file(&src, &dest, false, None).unwrap();
 
         assert_eq!(fs::read_to_string(&dest).unwrap(), "nested");
     }
@@ -494,8 +431,7 @@ mod tests {
         let src = dir.path().join("missing.txt");
         let dest = dir.path().join("dest.txt");
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        let result = sync_file(&src, &dest, &guard, false, None);
+        let result = sync_file(&src, &dest, false, None);
         assert!(result.is_err());
     }
 
@@ -505,8 +441,7 @@ mod tests {
         let file = dir.path().join("to_delete.txt");
         fs::write(&file, "bye").unwrap();
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        sync_delete(&file, &guard).unwrap();
+        sync_delete(&file).unwrap();
 
         assert!(!file.exists());
     }
@@ -516,8 +451,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("missing.txt");
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        assert!(sync_delete(&file, &guard).is_ok());
+        assert!(sync_delete(&file).is_ok());
     }
 
     #[test]
@@ -545,8 +479,7 @@ mod tests {
         fs::write(dir_a.path().join("hello.md"), "from A").unwrap();
 
         let pair = make_pair(dir_a.path(), dir_b.path(), "*.md", false);
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        initial_sync(&pair, &guard, None).unwrap();
+        initial_sync(&pair, None).unwrap();
 
         assert_eq!(
             fs::read_to_string(dir_b.path().join("hello.md")).unwrap(),
@@ -562,8 +495,7 @@ mod tests {
         fs::write(dir_b.path().join("b_only.md"), "B").unwrap();
 
         let pair = make_pair(dir_a.path(), dir_b.path(), "*.md", false);
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        initial_sync(&pair, &guard, None).unwrap();
+        initial_sync(&pair, None).unwrap();
 
         assert!(dir_b.path().join("a_only.md").exists());
         assert!(dir_a.path().join("b_only.md").exists());
@@ -580,8 +512,7 @@ mod tests {
         fs::write(dir_b.path().join("file.md"), "new from B").unwrap();
 
         let pair = make_pair(dir_a.path(), dir_b.path(), "*.md", false);
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        initial_sync(&pair, &guard, None).unwrap();
+        initial_sync(&pair, None).unwrap();
 
         // B is newer, so A should get B's content
         assert_eq!(
@@ -600,8 +531,7 @@ mod tests {
         let dest = dir.path().join("dest.txt");
         fs::write(&src, "hello").unwrap();
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        let outcome = sync_file(&src, &dest, &guard, false, None).unwrap();
+        let outcome = sync_file(&src, &dest, false, None).unwrap();
         assert!(matches!(outcome, SyncOutcome::Synced));
     }
 
@@ -613,8 +543,7 @@ mod tests {
         fs::write(&src, "").unwrap();
         fs::write(&dest, "precious").unwrap();
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        let outcome = sync_file(&src, &dest, &guard, false, None).unwrap();
+        let outcome = sync_file(&src, &dest, false, None).unwrap();
         assert!(matches!(outcome, SyncOutcome::SkippedEmpty));
     }
 
@@ -626,11 +555,9 @@ mod tests {
         fs::write(&src, "non-empty").unwrap();
         fs::write(&dest, "precious").unwrap();
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
         let outcome = sync_file(
             &src,
             &dest,
-            &guard,
             false,
             Some(("cat /dev/null", TEST_PIPELINE_TIMEOUT)),
         )
@@ -646,8 +573,7 @@ mod tests {
         fs::write(&src, "").unwrap();
         fs::write(&dest, "important content").unwrap();
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        sync_file(&src, &dest, &guard, false, None).unwrap();
+        sync_file(&src, &dest, false, None).unwrap();
 
         assert_eq!(fs::read_to_string(&dest).unwrap(), "important content");
     }
@@ -660,8 +586,7 @@ mod tests {
         fs::write(&src, "").unwrap();
         fs::write(&dest, "will be overwritten").unwrap();
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        sync_file(&src, &dest, &guard, true, None).unwrap();
+        sync_file(&src, &dest, true, None).unwrap();
 
         assert_eq!(fs::read_to_string(&dest).unwrap(), "");
     }
@@ -673,8 +598,7 @@ mod tests {
         let dest = dir.path().join("new_file.txt");
         fs::write(&src, "").unwrap();
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        sync_file(&src, &dest, &guard, false, None).unwrap();
+        sync_file(&src, &dest, false, None).unwrap();
 
         assert_eq!(fs::read_to_string(&dest).unwrap(), "");
     }
@@ -687,8 +611,7 @@ mod tests {
         fs::write(&src, "new content").unwrap();
         fs::write(&dest, "old content").unwrap();
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        sync_file(&src, &dest, &guard, false, None).unwrap();
+        sync_file(&src, &dest, false, None).unwrap();
 
         assert_eq!(fs::read_to_string(&dest).unwrap(), "new content");
     }
@@ -747,8 +670,7 @@ mod tests {
             fs::set_permissions(&src, fs::Permissions::from_mode(0o000)).unwrap();
         }
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        let result = sync_file(&src, &dest, &guard, false, None);
+        let result = sync_file(&src, &dest, false, None);
 
         #[cfg(unix)]
         {
@@ -774,8 +696,7 @@ mod tests {
             fs::set_permissions(&src, fs::Permissions::from_mode(0o000)).unwrap();
         }
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        let _ = sync_file(&src, &dest, &guard, false, None);
+        let _ = sync_file(&src, &dest, false, None);
 
         #[cfg(unix)]
         {
@@ -799,8 +720,7 @@ mod tests {
         fs::write(&src, "").unwrap();
         fs::write(&dest, "precious content").unwrap();
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        sync_file(&src, &dest, &guard, false, None).unwrap();
+        sync_file(&src, &dest, false, None).unwrap();
 
         assert_eq!(fs::read_to_string(&dest).unwrap(), "precious content");
 
@@ -814,18 +734,15 @@ mod tests {
         let dest = dir.path().join("dest.txt");
         fs::write(&src, "abc").unwrap();
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
         sync_file(
             &src,
             &dest,
-            &guard,
             false,
             Some(("tr a-z A-Z", TEST_PIPELINE_TIMEOUT)),
         )
         .unwrap();
 
         assert_eq!(fs::read_to_string(&dest).unwrap(), "ABC");
-        assert!(guard.is_echo(&dest));
     }
 
     #[test]
@@ -836,11 +753,9 @@ mod tests {
         fs::write(&src, "input").unwrap();
         fs::write(&dest, "original").unwrap();
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
         let result = sync_file(
             &src,
             &dest,
-            &guard,
             false,
             Some(("exit 1", TEST_PIPELINE_TIMEOUT)),
         );
@@ -861,12 +776,10 @@ mod tests {
         fs::write(&src, "non-empty").unwrap();
         fs::write(&dest, "precious").unwrap();
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
         // `cat /dev/null` produces 0 bytes regardless of input.
         sync_file(
             &src,
             &dest,
-            &guard,
             false,
             Some(("cat /dev/null", TEST_PIPELINE_TIMEOUT)),
         )
@@ -909,8 +822,7 @@ mod tests {
             },
         };
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        initial_sync(&pair, &guard, None).unwrap();
+        initial_sync(&pair, None).unwrap();
 
         // A's only_a.md propagated to B as only_a.md.gz (cat is identity).
         assert_eq!(
@@ -959,8 +871,7 @@ mod tests {
             content: ContentTransform::Identity,
         };
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        let result = initial_sync(&pair, &guard, None);
+        let result = initial_sync(&pair, None);
 
         assert!(
             result.is_ok(),
@@ -1006,8 +917,7 @@ mod tests {
             content: ContentTransform::Identity,
         };
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        let result = initial_sync(&pair, &guard, None);
+        let result = initial_sync(&pair, None);
 
         assert!(
             result.is_ok(),
@@ -1058,9 +968,8 @@ mod tests {
         assert_eq!(top, dir_b.path().join("notes.md.gz"));
         assert_eq!(nested, dir_b.path().join("sub/x.md.gz"));
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        sync_delete(&top, &guard).unwrap();
-        sync_delete(&nested, &guard).unwrap();
+        sync_delete(&top).unwrap();
+        sync_delete(&nested).unwrap();
 
         assert!(!dir_b.path().join("notes.md.gz").exists());
         assert!(!dir_b.path().join("sub/x.md.gz").exists());
@@ -1104,9 +1013,8 @@ mod tests {
         assert_eq!(top, dir_a.path().join("notes.md"));
         assert_eq!(nested, dir_a.path().join("sub/x.md"));
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        sync_delete(&top, &guard).unwrap();
-        sync_delete(&nested, &guard).unwrap();
+        sync_delete(&top).unwrap();
+        sync_delete(&nested).unwrap();
 
         assert!(!dir_a.path().join("notes.md").exists());
         assert!(!dir_a.path().join("sub/x.md").exists());
@@ -1146,8 +1054,7 @@ mod tests {
             },
         };
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        let result = initial_sync(&pair, &guard, None);
+        let result = initial_sync(&pair, None);
 
         // Per-file failures must not propagate; initial_sync logs and continues.
         assert!(
@@ -1196,11 +1103,11 @@ mod tests {
         let target = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         force_set_mtime(&src, target);
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-        sync_file(&src, &dest, &guard, false, None).unwrap();
+        sync_file(&src, &dest, false, None).unwrap();
 
         let dest_mtime = fs::metadata(&dest).unwrap().modified().unwrap();
         assert_mtimes_match(dest_mtime, target, "identity copy mtime");
+        assert!(mtimes_match_within_slack(&src, &dest), "post-sync mtimes must match for steady-state idempotence");
     }
 
     #[test]
@@ -1213,11 +1120,9 @@ mod tests {
         let target = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         force_set_mtime(&src, target);
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
         sync_file(
             &src,
             &dest,
-            &guard,
             false,
             Some(("cat", TEST_PIPELINE_TIMEOUT)),
         )
@@ -1225,6 +1130,7 @@ mod tests {
 
         let dest_mtime = fs::metadata(&dest).unwrap().modified().unwrap();
         assert_mtimes_match(dest_mtime, target, "pipeline output mtime");
+        assert!(mtimes_match_within_slack(&src, &dest), "post-sync mtimes must match for steady-state idempotence");
     }
 
     // The motivating case: a pipeline that produces different bytes on every
@@ -1268,9 +1174,7 @@ mod tests {
             },
         };
 
-        let guard = SyncGuard::new(Duration::from_secs(2));
-
-        initial_sync(&pair, &guard, None).unwrap();
+        initial_sync(&pair, None).unwrap();
         let dest = dir_b.path().join("foo.md.gz");
         let bytes_after_first = fs::read(&dest).unwrap();
         assert!(
@@ -1278,7 +1182,7 @@ mod tests {
             "first initial_sync should write B"
         );
 
-        initial_sync(&pair, &guard, None).unwrap();
+        initial_sync(&pair, None).unwrap();
         let bytes_after_second = fs::read(&dest).unwrap();
         assert_eq!(
             bytes_after_first, bytes_after_second,
@@ -1286,5 +1190,72 @@ mod tests {
         );
         // A must be untouched too — no inverse pipeline ran.
         assert_eq!(fs::read(dir_a.path().join("foo.md")).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn test_mtimes_match_within_slack_exact_equality() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        fs::write(&a, "x").unwrap();
+        fs::write(&b, "y").unwrap();
+
+        let target = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        force_set_mtime(&a, target);
+        force_set_mtime(&b, target);
+
+        assert!(mtimes_match_within_slack(&a, &b));
+    }
+
+    #[test]
+    fn test_mtimes_match_within_slack_within_slack() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        fs::write(&a, "x").unwrap();
+        fs::write(&b, "y").unwrap();
+
+        let target_a = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let target_b = target_a + Duration::from_millis(500);
+        force_set_mtime(&a, target_a);
+        force_set_mtime(&b, target_b);
+
+        assert!(mtimes_match_within_slack(&a, &b));
+    }
+
+    #[test]
+    fn test_mtimes_match_within_slack_beyond_slack() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        fs::write(&a, "x").unwrap();
+        fs::write(&b, "y").unwrap();
+
+        let target_a = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let target_b = target_a + Duration::from_secs(2);
+        force_set_mtime(&a, target_a);
+        force_set_mtime(&b, target_b);
+
+        assert!(!mtimes_match_within_slack(&a, &b));
+    }
+
+    #[test]
+    fn test_mtimes_match_within_slack_missing_source() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("missing.txt");
+        let b = dir.path().join("b.txt");
+        fs::write(&b, "y").unwrap();
+
+        assert!(!mtimes_match_within_slack(&a, &b));
+    }
+
+    #[test]
+    fn test_mtimes_match_within_slack_missing_dest() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("missing.txt");
+        fs::write(&a, "x").unwrap();
+
+        assert!(!mtimes_match_within_slack(&a, &b));
     }
 }

@@ -112,7 +112,7 @@ Each pair defines two glob patterns. The static prefix (everything before the fi
 
 A filesystem watcher (via [notify](https://docs.rs/notify)) is created for each side of every pair. File events are pushed into a channel, filtered by glob match, and then copied to the other side.
 
-To prevent infinite sync loops, a `SyncGuard` marks destination paths before writing. When the watcher fires for our own write, the event is recognized as an echo and skipped (2-second TTL).
+To prevent infinite sync loops, bsync skips a sync when source and destination already have matching mtimes (within 1-second slack). After every sync, the source's mtime is propagated to the destination, so steady-state mtime equality is the loop-breaking invariant: any echo event — from FSEvents racing our own write, from cloud-storage providers re-touching files, or from any other source — finds matching mtimes and short-circuits. A real user edit changes source mtime, breaking the equality and triggering a real sync.
 
 Sending `SIGHUP` triggers a config reload without restarting the process.
 

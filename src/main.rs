@@ -266,7 +266,6 @@ fn run_sync_loop(config_path: &Path) {
     };
 
     let mut pairs = pairs;
-    let mut guard = sync::SyncGuard::new(Duration::from_secs(2));
     let (mut tx, mut rx) = std::sync::mpsc::channel();
     let mut _watchers;
 
@@ -295,7 +294,7 @@ fn run_sync_loop(config_path: &Path) {
         };
 
         for (pair, gi_cache) in pairs.iter().zip(gi_caches.iter()) {
-            if let Err(e) = sync::initial_sync(pair, &guard, gi_cache.as_ref()) {
+            if let Err(e) = sync::initial_sync(pair, gi_cache.as_ref()) {
                 tracing::error!(
                     "Initial sync failed for {} <-> {}: {e}",
                     pair.a_pattern,
@@ -309,11 +308,6 @@ fn run_sync_loop(config_path: &Path) {
         loop {
             match rx.recv_timeout(Duration::from_secs(5)) {
                 Ok(event) => {
-                    if guard.is_echo(&event.path) {
-                        tracing::debug!("Skipping echo event for {}", event.path.display());
-                        continue;
-                    }
-
                     let pair = &pairs[event.pair_index];
                     let dest = match event.side {
                         watcher::Side::A => pair.a_to_b_path(&event.relative),
@@ -345,10 +339,17 @@ fn run_sync_loop(config_path: &Path) {
 
                     match event.kind {
                         watcher::SyncEventKind::CreateOrModify => {
+                            if sync::mtimes_match_within_slack(&event.path, &dest) {
+                                tracing::debug!(
+                                    "Skipping {} -> {} (already up to date)",
+                                    event.path.display(),
+                                    dest.display()
+                                );
+                                continue;
+                            }
                             match sync::sync_file(
                                 &event.path,
                                 &dest,
-                                &guard,
                                 pair.allow_empty_sync,
                                 pipeline,
                             ) {
@@ -373,7 +374,7 @@ fn run_sync_loop(config_path: &Path) {
                         }
                         watcher::SyncEventKind::Delete => {
                             if pair.sync_deletions {
-                                if let Err(e) = sync::sync_delete(&dest, &guard) {
+                                if let Err(e) = sync::sync_delete(&dest) {
                                     tracing::error!("Delete sync failed {}: {e}", dest.display());
                                 }
                             } else {
@@ -386,7 +387,7 @@ fn run_sync_loop(config_path: &Path) {
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    guard.prune();
+                    // Idle wakeup so the shutdown / reload signal flags below get polled.
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     tracing::error!("All watcher channels disconnected");
@@ -408,7 +409,6 @@ fn run_sync_loop(config_path: &Path) {
                 match config::load(config_path) {
                     Ok(new_pairs) => {
                         pairs = new_pairs;
-                        guard = sync::SyncGuard::new(Duration::from_secs(2));
                         let (new_tx, new_rx) = std::sync::mpsc::channel();
                         tx = new_tx;
                         rx = new_rx;

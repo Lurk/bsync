@@ -31,8 +31,8 @@ impl GitignoreCache {
         if self.built_at.elapsed() > self.ttl {
             self.rebuild();
         }
-        self.a_matcher.matched(relative, false).is_ignore()
-            || self.b_matcher.matched(relative, false).is_ignore()
+        self.a_matcher.matched_path_or_any_parents(relative, false).is_ignore()
+            || self.b_matcher.matched_path_or_any_parents(relative, false).is_ignore()
     }
 
     fn rebuild(&mut self) {
@@ -140,5 +140,42 @@ mod tests {
         // Next call should rebuild and pick up the new rule
         std::thread::sleep(Duration::from_millis(1));
         assert!(cache.is_ignored(Path::new("test.log")));
+    }
+
+    #[test]
+    fn test_directory_prefix_rule_matches_files_inside() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+
+        fs::write(dir_a.path().join(".gitignore"), "/target\n").unwrap();
+        let mut cache = GitignoreCache::new(dir_a.path().to_path_buf(), dir_b.path().to_path_buf());
+
+        assert!(cache.is_ignored(Path::new("target/foo.md")));
+        assert!(cache.is_ignored(Path::new("target/sub/bar.md")));
+        assert!(!cache.is_ignored(Path::new("notes/foo.md")));
+    }
+
+    #[test]
+    fn test_bare_name_rule_matches_nested_files() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+
+        fs::write(dir_a.path().join(".gitignore"), "node_modules\n").unwrap();
+        let mut cache = GitignoreCache::new(dir_a.path().to_path_buf(), dir_b.path().to_path_buf());
+
+        assert!(cache.is_ignored(Path::new("frontend/node_modules/x/readme.md")));
+        assert!(cache.is_ignored(Path::new("node_modules/x/readme.md")));
+        assert!(!cache.is_ignored(Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn test_b_side_directory_prefix_blocks_both() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+
+        fs::write(dir_b.path().join(".gitignore"), "/target\n").unwrap();
+        let mut cache = GitignoreCache::new(dir_a.path().to_path_buf(), dir_b.path().to_path_buf());
+
+        assert!(cache.is_ignored(Path::new("target/foo.md")));
     }
 }
