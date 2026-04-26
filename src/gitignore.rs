@@ -31,8 +31,13 @@ impl GitignoreCache {
         if self.built_at.elapsed() > self.ttl {
             self.rebuild();
         }
-        self.a_matcher.matched_path_or_any_parents(relative, false).is_ignore()
-            || self.b_matcher.matched_path_or_any_parents(relative, false).is_ignore()
+        self.a_matcher
+            .matched_path_or_any_parents(relative, false)
+            .is_ignore()
+            || self
+                .b_matcher
+                .matched_path_or_any_parents(relative, false)
+                .is_ignore()
     }
 
     fn rebuild(&mut self) {

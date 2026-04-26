@@ -753,12 +753,7 @@ mod tests {
         fs::write(&src, "input").unwrap();
         fs::write(&dest, "original").unwrap();
 
-        let result = sync_file(
-            &src,
-            &dest,
-            false,
-            Some(("exit 1", TEST_PIPELINE_TIMEOUT)),
-        );
+        let result = sync_file(&src, &dest, false, Some(("exit 1", TEST_PIPELINE_TIMEOUT)));
         assert!(result.is_err());
         assert_eq!(fs::read_to_string(&dest).unwrap(), "original");
         assert_eq!(
@@ -1107,7 +1102,10 @@ mod tests {
 
         let dest_mtime = fs::metadata(&dest).unwrap().modified().unwrap();
         assert_mtimes_match(dest_mtime, target, "identity copy mtime");
-        assert!(mtimes_match_within_slack(&src, &dest), "post-sync mtimes must match for steady-state idempotence");
+        assert!(
+            mtimes_match_within_slack(&src, &dest),
+            "post-sync mtimes must match for steady-state idempotence"
+        );
     }
 
     #[test]
@@ -1120,17 +1118,14 @@ mod tests {
         let target = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         force_set_mtime(&src, target);
 
-        sync_file(
-            &src,
-            &dest,
-            false,
-            Some(("cat", TEST_PIPELINE_TIMEOUT)),
-        )
-        .unwrap();
+        sync_file(&src, &dest, false, Some(("cat", TEST_PIPELINE_TIMEOUT))).unwrap();
 
         let dest_mtime = fs::metadata(&dest).unwrap().modified().unwrap();
         assert_mtimes_match(dest_mtime, target, "pipeline output mtime");
-        assert!(mtimes_match_within_slack(&src, &dest), "post-sync mtimes must match for steady-state idempotence");
+        assert!(
+            mtimes_match_within_slack(&src, &dest),
+            "post-sync mtimes must match for steady-state idempotence"
+        );
     }
 
     // The motivating case: a pipeline that produces different bytes on every
