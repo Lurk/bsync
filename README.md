@@ -112,7 +112,9 @@ Each pair defines two glob patterns. The static prefix (everything before the fi
 
 A filesystem watcher (via [notify](https://docs.rs/notify)) is created for each side of every pair. File events are pushed into a channel, filtered by glob match, and then copied to the other side.
 
-To prevent infinite sync loops, bsync skips a sync when source and destination already have matching mtimes (within 1-second slack). After every sync, the source's mtime is propagated to the destination, so steady-state mtime equality is the loop-breaking invariant: any echo event — from FSEvents racing our own write, from cloud-storage providers re-touching files, or from any other source — finds matching mtimes and short-circuits. A real user edit changes source mtime, breaking the equality and triggering a real sync.
+To prevent infinite sync loops, bsync skips a sync when source and destination already have matching mtimes. After every sync, the source's mtime is propagated to the destination, so steady-state mtime equality is the loop-breaking invariant: any echo event — from FSEvents racing our own write, from cloud-storage providers re-touching files, or from any other source — finds matching mtimes and short-circuits. A real user edit changes source mtime, breaking the equality and triggering a real sync.
+
+The match check is adaptive: when both sides are on a precision-preserving filesystem (APFS, ext4), exact equality is required, so even sub-second-rapid edits propagate. When one side is on a second-resolution filesystem (HFS+) and the other is not, mtime preservation truncates to the integer second; bsync detects that case (same integer second, one side already at `.000`) and treats it as a match.
 
 Sending `SIGHUP` triggers a config reload without restarting the process.
 

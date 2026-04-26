@@ -339,7 +339,7 @@ fn run_sync_loop(config_path: &Path) {
 
                     match event.kind {
                         watcher::SyncEventKind::CreateOrModify => {
-                            if sync::mtimes_match_within_slack(&event.path, &dest) {
+                            if sync::mtimes_match(&event.path, &dest) {
                                 tracing::debug!(
                                     "Skipping {} -> {} (already up to date)",
                                     event.path.display(),

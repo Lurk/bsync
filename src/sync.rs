@@ -83,27 +83,46 @@ fn temp_path_for(dest: &Path) -> PathBuf {
     }
 }
 
-/// Returns true iff both files exist and their mtimes are within 1 second.
+/// Returns true iff both files exist and their mtimes are equal,
+/// adaptively tolerating filesystem-truncation gaps.
 ///
 /// Used as the runtime-loop dedup check: after every successful sync we
 /// preserve source mtime on dest, so source.mtime == dest.mtime is the
 /// steady-state invariant. Any echo event finds matching mtimes and
-/// short-circuits; a real user edit changes source mtime and triggers a
-/// real sync. The 1-second slack covers filesystems with second-resolution
-/// timestamps (HFS+); APFS / ext4 round-trip exactly.
-pub fn mtimes_match_within_slack(a: &Path, b: &Path) -> bool {
+/// short-circuits; a real user edit changes source mtime and triggers
+/// a real sync.
+///
+/// When source and dest live on filesystems of equal precision
+/// (APFS↔APFS, ext4↔ext4, HFS+↔HFS+), the roundtrip is exact and only
+/// equality matches — rapid sub-second edits propagate immediately.
+///
+/// When precision differs (e.g. APFS source written through to an HFS+
+/// dest), preserving mtime truncates the dest to an integer second.
+/// We detect this case — same integer second, with at least one side
+/// already at subsec=0 — and treat it as a match. A real sub-second
+/// edit on a precision-preserving FS will move source out of that
+/// second (or to a different sub-second within it, with both subsecs
+/// nonzero) and break the match.
+pub fn mtimes_match(a: &Path, b: &Path) -> bool {
     let Ok(am) = fs::metadata(a).and_then(|m| m.modified()) else {
         return false;
     };
     let Ok(bm) = fs::metadata(b).and_then(|m| m.modified()) else {
         return false;
     };
-    let diff = if am > bm {
-        am.duration_since(bm)
-    } else {
-        bm.duration_since(am)
+    if am == bm {
+        return true;
+    }
+    let Ok(ad) = am.duration_since(SystemTime::UNIX_EPOCH) else {
+        return false;
     };
-    diff.map(|d| d < Duration::from_secs(1)).unwrap_or(false)
+    let Ok(bd) = bm.duration_since(SystemTime::UNIX_EPOCH) else {
+        return false;
+    };
+    if ad.as_secs() != bd.as_secs() {
+        return false;
+    }
+    ad.subsec_nanos() == 0 || bd.subsec_nanos() == 0
 }
 
 pub fn sync_file(
@@ -170,14 +189,13 @@ pub fn sync_file(
         return Err(SyncError::Io(e));
     }
 
-    // Propagate source mtime to dest so initial_sync's mtime comparison
-    // converges across daemon restarts. Without this, dest's mtime is "now"
-    // after a sync, the next startup sees dest newer than source, and a
-    // non-deterministic pipeline (bare `gzip` embeds a timestamp) ping-pongs
-    // forever. Failures here are non-fatal: the data is already on disk.
-    if let Err(e) = preserve_mtime(dest, source_mtime) {
-        tracing::warn!("Failed to preserve mtime on {}: {e}", dest.display());
-    }
+    // Propagate source mtime to dest. This is the loop-breaking invariant
+    // for both initial_sync (cross-restart convergence) and the runtime
+    // dedup check (mtimes_match). If this fails, dest holds the right
+    // bytes but the wrong mtime — so the next watcher echo will not match
+    // and we'll busy-loop attempting the sync again. Surface as an error
+    // so the failure is loud rather than a single warn that gets lost.
+    preserve_mtime(dest, source_mtime).map_err(SyncError::Io)?;
 
     tracing::info!("Synced {} -> {}", source.display(), dest.display());
     Ok(SyncOutcome::Synced)
@@ -1103,7 +1121,7 @@ mod tests {
         let dest_mtime = fs::metadata(&dest).unwrap().modified().unwrap();
         assert_mtimes_match(dest_mtime, target, "identity copy mtime");
         assert!(
-            mtimes_match_within_slack(&src, &dest),
+            mtimes_match(&src, &dest),
             "post-sync mtimes must match for steady-state idempotence"
         );
     }
@@ -1123,7 +1141,7 @@ mod tests {
         let dest_mtime = fs::metadata(&dest).unwrap().modified().unwrap();
         assert_mtimes_match(dest_mtime, target, "pipeline output mtime");
         assert!(
-            mtimes_match_within_slack(&src, &dest),
+            mtimes_match(&src, &dest),
             "post-sync mtimes must match for steady-state idempotence"
         );
     }
@@ -1188,7 +1206,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mtimes_match_within_slack_exact_equality() {
+    fn test_mtimes_match_exact_equality() {
         let dir = TempDir::new().unwrap();
         let a = dir.path().join("a.txt");
         let b = dir.path().join("b.txt");
@@ -1199,27 +1217,51 @@ mod tests {
         force_set_mtime(&a, target);
         force_set_mtime(&b, target);
 
-        assert!(mtimes_match_within_slack(&a, &b));
+        assert!(mtimes_match(&a, &b));
     }
 
+    // APFS source roundtripped to HFS+ dest: dest got truncated to integer
+    // second when preserve_mtime ran. Same integer second, dest.subsec=0 →
+    // treat as match.
     #[test]
-    fn test_mtimes_match_within_slack_within_slack() {
+    fn test_mtimes_match_truncation_gap() {
         let dir = TempDir::new().unwrap();
         let a = dir.path().join("a.txt");
         let b = dir.path().join("b.txt");
         fs::write(&a, "x").unwrap();
         fs::write(&b, "y").unwrap();
 
-        let target_a = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let target_b = target_a + Duration::from_millis(500);
+        let target_a = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(1_700_000_000)
+            + Duration::from_millis(500);
+        let target_b = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         force_set_mtime(&a, target_a);
         force_set_mtime(&b, target_b);
 
-        assert!(mtimes_match_within_slack(&a, &b));
+        assert!(mtimes_match(&a, &b));
     }
 
+    // Both sides have sub-second precision (APFS↔APFS). Different sub-seconds
+    // within the same integer second means a real rapid edit, not a
+    // truncation artifact — must NOT match, so the edit propagates.
     #[test]
-    fn test_mtimes_match_within_slack_beyond_slack() {
+    fn test_mtimes_match_rejects_rapid_subsec_edit() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        fs::write(&a, "x").unwrap();
+        fs::write(&b, "y").unwrap();
+
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        force_set_mtime(&a, base + Duration::from_millis(750));
+        force_set_mtime(&b, base + Duration::from_millis(250));
+
+        assert!(!mtimes_match(&a, &b));
+    }
+
+    // Different integer seconds: never a match, regardless of slack.
+    #[test]
+    fn test_mtimes_match_different_seconds() {
         let dir = TempDir::new().unwrap();
         let a = dir.path().join("a.txt");
         let b = dir.path().join("b.txt");
@@ -1231,26 +1273,43 @@ mod tests {
         force_set_mtime(&a, target_a);
         force_set_mtime(&b, target_b);
 
-        assert!(!mtimes_match_within_slack(&a, &b));
+        assert!(!mtimes_match(&a, &b));
+    }
+
+    // Adjacent across a second boundary (e.g. 5.999s vs 6.000s): conservative
+    // — different integer second, treat as a real change.
+    #[test]
+    fn test_mtimes_match_across_second_boundary() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        fs::write(&a, "x").unwrap();
+        fs::write(&b, "y").unwrap();
+
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        force_set_mtime(&a, base + Duration::from_millis(999));
+        force_set_mtime(&b, base + Duration::from_secs(1));
+
+        assert!(!mtimes_match(&a, &b));
     }
 
     #[test]
-    fn test_mtimes_match_within_slack_missing_source() {
+    fn test_mtimes_match_missing_source() {
         let dir = TempDir::new().unwrap();
         let a = dir.path().join("missing.txt");
         let b = dir.path().join("b.txt");
         fs::write(&b, "y").unwrap();
 
-        assert!(!mtimes_match_within_slack(&a, &b));
+        assert!(!mtimes_match(&a, &b));
     }
 
     #[test]
-    fn test_mtimes_match_within_slack_missing_dest() {
+    fn test_mtimes_match_missing_dest() {
         let dir = TempDir::new().unwrap();
         let a = dir.path().join("a.txt");
         let b = dir.path().join("missing.txt");
         fs::write(&a, "x").unwrap();
 
-        assert!(!mtimes_match_within_slack(&a, &b));
+        assert!(!mtimes_match(&a, &b));
     }
 }
