@@ -208,11 +208,17 @@ fn preserve_mtime(path: &Path, mtime: SystemTime) -> std::io::Result<()> {
 }
 
 pub fn sync_delete(target: &Path) -> Result<(), SyncError> {
-    if target.exists() {
-        fs::remove_file(target)?;
-        tracing::info!("Deleted {}", target.display());
+    // Race-free: exists()+remove_file is a TOCTOU that produces ENOENT log
+    // spam under the echo loop. Let remove_file decide; treat NotFound as
+    // success since the goal is "target is gone."
+    match fs::remove_file(target) {
+        Ok(()) => {
+            tracing::info!("Deleted {}", target.display());
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(SyncError::Io(e)),
     }
-    Ok(())
 }
 
 pub fn initial_sync(

@@ -373,15 +373,27 @@ fn run_sync_loop(config_path: &Path) {
                             }
                         }
                         watcher::SyncEventKind::Delete => {
-                            if pair.sync_deletions {
-                                if let Err(e) = sync::sync_delete(&dest) {
-                                    tracing::error!("Delete sync failed {}: {e}", dest.display());
-                                }
-                            } else {
+                            if !pair.sync_deletions {
                                 tracing::debug!(
                                     "Ignoring delete event for {} (sync_deletions=false)",
                                     event.path.display()
                                 );
+                                continue;
+                            }
+                            // sync_file's atomic rename fires a Remove event on
+                            // the dest path even when the file is being
+                            // replaced, not truly deleted. If the source path
+                            // still exists, this is an echo — drop it.
+                            // Symmetric to the mtimes_match guard above.
+                            if event.path.exists() {
+                                tracing::debug!(
+                                    "Skipping delete echo for {} (path still exists)",
+                                    event.path.display()
+                                );
+                                continue;
+                            }
+                            if let Err(e) = sync::sync_delete(&dest) {
+                                tracing::error!("Delete sync failed {}: {e}", dest.display());
                             }
                         }
                     }
